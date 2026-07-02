@@ -1,6 +1,7 @@
 package io.github.takahirom.clijvm.cli
 
 import com.github.ajalt.clikt.core.CliktCommand
+import com.github.ajalt.clikt.core.CliktError
 import com.github.ajalt.clikt.parameters.options.default
 import com.github.ajalt.clikt.parameters.options.flag
 import com.github.ajalt.clikt.parameters.options.option
@@ -35,9 +36,12 @@ class ListCommand : CliktCommand(
     ).flag()
 
     override fun run() {
-        val processes = JvmDiscovery.list().let { list ->
-            if (testWorkers) list.filter { it.isGradleWorker } else list
+        val all = try {
+            JvmDiscovery.list()
+        } catch (e: Exception) {
+            throw CliktError("Could not enumerate JVM processes: ${e.message}")
         }
+        val processes = if (testWorkers) all.filter { it.isGradleWorker } else all
         echo(if (format == "json") renderJson(processes) else renderTable(processes))
     }
 

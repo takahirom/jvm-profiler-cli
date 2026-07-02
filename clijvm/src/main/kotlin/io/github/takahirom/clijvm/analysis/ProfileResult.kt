@@ -27,11 +27,59 @@ data class ThreadBreakdown(
     val topMethods: List<HotMethod>,
 )
 
+/**
+ * Where one thread's non-CPU time went, from JFR `jdk.ThreadPark`, `jdk.JavaMonitorWait`, and
+ * `jdk.ThreadSleep` events. Times are duration-weighted totals; a thread can accumulate more wait
+ * time than the wall clock if it parks repeatedly.
+ */
+data class ThreadWait(
+    val thread: String,
+    val parkedMs: Double,
+    val monitorWaitMs: Double,
+    val sleepMs: Double,
+    val parkEvents: Int,
+    val monitorWaitEvents: Int,
+    val sleepEvents: Int,
+    /** Blocking classes seen (`parkedClass` / `monitorClass`), most-frequent first. */
+    val topBlockers: List<String>,
+    /** A representative stack (from this thread's longest single wait), ordered leaf-first. */
+    val stack: List<String>,
+) {
+    val totalMs: Double get() = parkedMs + monitorWaitMs + sleepMs
+    val totalEvents: Int get() = parkEvents + monitorWaitEvents + sleepEvents
+}
+
+/** Thread wait/park/sleep analysis. Rendered only on demand (`report --waits`), never by default. */
+data class WaitStats(
+    /** Threads ranked by total wait time, longest first. */
+    val threads: List<ThreadWait>,
+    /** Sum of all threads' wait time (cumulative; may exceed wall-clock duration). */
+    val totalWaitMs: Double,
+)
+
 /** Garbage collection pause statistics over the recording. */
 data class GcStats(
     val count: Int,
     val totalPauseMs: Double,
     val maxPauseMs: Double,
+)
+
+/** Direction of the post-GC heap trend across a recording. */
+enum class HeapTrendDirection { GROWING, STABLE, SHRINKING, INSUFFICIENT_DATA }
+
+/**
+ * The trend of live (post-GC) heap over the recording, from `jdk.GCHeapSummary` "After GC" events.
+ * Steadily growing post-GC heap is the classic memory-leak / growing-retained-set signature;
+ * flat or shrinking heap (with enough GCs to judge) is a positive "probably no leak" signal.
+ */
+data class HeapTrend(
+    /** Number of post-GC heap samples observed. */
+    val gcCount: Int,
+    val firstThirdAvgBytes: Long,
+    val lastThirdAvgBytes: Long,
+    val minBytes: Long,
+    val maxBytes: Long,
+    val direction: HeapTrendDirection,
 )
 
 /** A distinct stack observed in CPU samples, ordered root-first for flamegraph output. */
@@ -86,6 +134,10 @@ data class ProfileResult(
     val allocation: AllocationStats?,
     /** Class-loading stats, or null when the recording contains no such events. */
     val classLoading: ClassLoadingStats?,
+    /** Thread wait/park/sleep analysis for `report --waits`; null when no wait events were recorded. */
+    val waits: WaitStats? = null,
+    /** Post-GC heap trend (leak signal), or null when no `jdk.GCHeapSummary` events were recorded. */
+    val heapTrend: HeapTrend? = null,
     val recordingPath: String?,
     /** Whether this recording was salvaged from a dead target and may be incomplete. */
     val partial: Boolean = false,

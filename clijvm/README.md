@@ -62,10 +62,15 @@ stack. That's too much to read all at once. `report` is **layered** so an AI can
 drill only into what matters. `report --help` teaches the whole workflow on its own:
 
 1. **Layer 0 — `--digest`**: takeaways only. Warnings, hints, and headline numbers (pid, duration,
-   samples, GC, class loading, allocation totals). No hot-method/allocation lists, no stacks.
+   samples, GC, class loading, allocation totals, and the post-GC heap trend). No hot-method/
+   allocation lists, no stacks.
    ```bash
    clijvm report --last --digest             # ~1 KB
    ```
+   The digest carries a **post-GC heap trend** (`postGcHeap` in JSON) derived from `jdk.GCHeapSummary`
+   "After GC" events, so "is it leaking?" is answerable from the digest alone: steady growth becomes a
+   hint ("Post-GC heap grew from ~120 MB to ~340 MB … possible leak"), while flat/shrinking heap reads
+   as a positive signal ("Post-GC heap: stable (~120 MB) over N GCs").
 2. **Layer 1 — the default**: the top hot methods/threads/sites (numbered `#1`, `#2`, …) with
    shallow stacks. `--top N` (default 5) and `--max-stack-depth D` (default 5) control the size. A
    trimmed stack is flagged — `… (23 more frames)` in summary, `"stackTruncated": true` /
@@ -82,6 +87,12 @@ drill only into what matters. `report --help` teaches the whole workflow on its 
    clijvm report --last --site 1             # one allocation site, full stack
    clijvm report --last --thread 1           # one thread's own hot methods
    ```
+
+Where does non-CPU time go? **`clijvm report --last --waits`** ranks threads by off-CPU time
+(park / monitor-wait / sleep), with per-type totals, event counts, top blocker classes, and a
+representative stack. Honors `--top` and `--max-stack-depth`; `--format json` supported. Reads the
+JFR `jdk.ThreadPark` / `jdk.JavaMonitorWait` / `jdk.ThreadSleep` events the recording already holds,
+so no re-profiling is needed.
 
 Pick the right recording first with **`clijvm report --list`** (file, timestamp, pid, mainClass, size;
 newest first; `--format json` for machines).
@@ -114,11 +125,14 @@ Gradle test workers are short-lived: they can die before you get to `stop`. Two 
   # then, in another shell: ./gradlew test
   ```
 - **Synchronous `--duration`** is the most dependable mode for short-lived processes, because the
-  recording is dumped as soon as the duration elapses.
+  recording is dumped as soon as the duration elapses. If the target exits *during* the recording,
+  clijvm salvages the JVM's dump-on-exit file and prints a `PARTIAL` report covering the time until
+  exit (e.g. "Target JVM exited 47s into the 180s recording") — no data loss, no raw attach
+  stacktrace. If the target is `kill -9`'d it cannot dump on the way out; you then get a clean
+  one-line error suggesting `--wait` with a shorter `--duration`.
 
-If you do use `cpu start`/`memory start` and the worker dies before `stop`, clijvm still tries to
-**salvage** a partial recording: the background recording is started with JFR `dumponexit=true`, so
-`stop` recovers whatever the JVM dumped on its way out and reports it, clearly marked `PARTIAL`.
+Both the synchronous path and `cpu start`/`memory start` use JFR `dumponexit=true`, so a worker that
+dies before you `stop` still yields a salvageable `PARTIAL` recording.
 
 ## Caveats
 

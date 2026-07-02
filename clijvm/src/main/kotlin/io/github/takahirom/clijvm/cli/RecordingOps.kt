@@ -13,6 +13,7 @@ import io.github.takahirom.clijvm.render.ReportView
 import io.github.takahirom.clijvm.session.Session
 import io.github.takahirom.clijvm.session.SessionEntry
 import io.github.takahirom.clijvm.session.SessionStore
+import io.github.takahirom.clijvm.util.JcmdException
 import io.github.takahirom.clijvm.util.RecordingMeta
 import io.github.takahirom.clijvm.util.recordingsDir
 import io.github.takahirom.clijvm.util.writeRecordingMeta
@@ -47,7 +48,16 @@ fun CliktCommand.resolveOrWait(target: String?, wait: String?, waitTimeout: Dura
     throw CliktError("Provide a target pid or name, or use --wait <name-substring>.")
 }
 
-/** Records [process] synchronously for [duration], then dumps, stops, and prints the report. */
+/** How often to poll the target's liveness while a synchronous recording runs. */
+private const val LIVENESS_POLL_MS = 500L
+
+/**
+ * Records [process] synchronously for [duration], then dumps, stops, and prints the report.
+ *
+ * The recording is started with dump-on-exit, and the target's liveness is polled during the wait,
+ * so if it dies mid-recording we salvage the auto-dumped file and print a PARTIAL report instead of
+ * losing everything (and instead of leaking a raw attach stacktrace). Ctrl-C still dumps and reports.
+ */
 fun CliktCommand.profileSynchronously(
     process: JvmProcess,
     duration: Duration,
@@ -60,38 +70,94 @@ fun CliktCommand.profileSynchronously(
     verifyAttach(pid, process.displayName)
 
     val recordingFile = newRecordingPath(pid)
+    val salvageFile = recordingsDir.resolve("sync-$pid-onexit.jfr")
+    Files.deleteIfExists(salvageFile)
     val recorder = JfrRecorder(pid)
 
     echo("Profiling pid $pid (${process.displayName}) for ${duration.toSeconds()}s ...")
-    recorder.start()
+    // Dump-on-exit means a mid-recording death still leaves a salvageable file behind.
+    try {
+        recorder.startWithDumpOnExit(salvageFile)
+    } catch (e: JcmdException) {
+        throw CliktError("Could not start recording on pid $pid (${process.displayName}): ${e.message}")
+    }
 
     val finished = AtomicBoolean(false)
     val startedAt = System.currentTimeMillis()
-    val finish = {
-        if (finished.compareAndSet(false, true)) {
-            recorder.dump(recordingFile)
-            recorder.stop()
-            val durationMs = System.currentTimeMillis() - startedAt
-            writeRecordingMeta(
-                recordingFile,
-                RecordingMeta(pid, process.displayName, startedAt, partial = false),
+
+    fun report(result: io.github.takahirom.clijvm.analysis.ProfileResult) {
+        writeReport(Renderers.render(result, format, view, renderOptions), output)
+        echoDrillGuidance(recordingFile, format, output, renderOptions.digest)
+    }
+
+    fun reportLive() {
+        recorder.dump(recordingFile)
+        recorder.stop()
+        Files.deleteIfExists(salvageFile)
+        val durationMs = System.currentTimeMillis() - startedAt
+        writeRecordingMeta(recordingFile, RecordingMeta(pid, process.displayName, startedAt, partial = false))
+        echo("Recording saved to $recordingFile")
+        report(JfrAnalyzer.analyze(recordingFile, pid, process.displayName, durationMs))
+    }
+
+    fun reportSalvaged(diedAfterMs: Long) {
+        val salvaged = awaitSalvage(salvageFile)
+            ?: throw CliktError(
+                "Target JVM (pid $pid) exited before any data could be dumped. " +
+                    "For short-lived processes prefer --wait with a shorter --duration."
             )
-            val result = JfrAnalyzer.analyze(recordingFile, pid, process.displayName, durationMs)
-            echo("Recording saved to $recordingFile")
-            writeReport(Renderers.render(result, format, view, renderOptions), output)
-            echoDrillGuidance(recordingFile, format, output, renderOptions.digest)
+        Files.move(salvaged, recordingFile, StandardCopyOption.REPLACE_EXISTING)
+        writeRecordingMeta(recordingFile, RecordingMeta(pid, process.displayName, startedAt, partial = true))
+        echo(
+            "Target JVM exited ${diedAfterMs / 1000}s into the ${duration.toSeconds()}s recording; " +
+                "report covers the time until exit."
+        )
+        echo("Recording saved to $recordingFile")
+        // Let the analyzer derive the duration from the recording's own timespan.
+        report(JfrAnalyzer.analyze(recordingFile, pid, process.displayName, partial = true))
+    }
+
+    // Claims the single report and routes to the live or salvage path.
+    fun finish(targetDead: Boolean) {
+        if (!finished.compareAndSet(false, true)) return
+        if (targetDead) {
+            reportSalvaged(System.currentTimeMillis() - startedAt)
+            return
+        }
+        try {
+            reportLive()
+        } catch (e: JcmdException) {
+            // A dump/stop failed — almost always the target died just now. Salvage instead of erroring.
+            if (isProcessAlive(pid)) throw CliktError("Recording on pid $pid failed: ${e.message}")
+            reportSalvaged(System.currentTimeMillis() - startedAt)
         }
     }
 
-    // Ensure Ctrl-C still dumps, stops, and reports.
-    val shutdownHook = Thread { runCatching { finish() } }
+    // Ctrl-C: dump, stop, and report the live target.
+    val shutdownHook = Thread { runCatching { finish(targetDead = false) } }
     Runtime.getRuntime().addShutdownHook(shutdownHook)
     try {
-        Thread.sleep(duration.toMillis())
-        finish()
+        val deadline = startedAt + duration.toMillis()
+        while (System.currentTimeMillis() < deadline) {
+            if (!isProcessAlive(pid)) {
+                finish(targetDead = true)
+                return
+            }
+            Thread.sleep((deadline - System.currentTimeMillis()).coerceIn(1, LIVENESS_POLL_MS))
+        }
+        finish(targetDead = !isProcessAlive(pid))
     } finally {
         runCatching { Runtime.getRuntime().removeShutdownHook(shutdownHook) }
     }
+}
+
+/** Waits briefly for a JVM's dump-on-exit file to appear and be non-empty; null if it never does. */
+private fun awaitSalvage(file: Path): Path? {
+    repeat(20) {
+        if (Files.exists(file) && Files.size(file) > 0) return file
+        Thread.sleep(100)
+    }
+    return file.takeIf { Files.exists(it) && Files.size(it) > 0 }
 }
 
 /**
@@ -116,9 +182,10 @@ private fun CliktCommand.echoDrillGuidance(
 internal fun drillGuidance(recording: String, digest: Boolean): String =
     if (digest) {
         "Drill in: run 'clijvm report $recording' first to get #N indices, " +
-            "then --method N / --site N / --thread N."
+            "then --method N / --site N / --thread N (or --waits for off-CPU time)."
     } else {
-        "Drill in: clijvm report $recording --method N (see #N above), or --digest for takeaways."
+        "Drill in: clijvm report $recording --method N (see #N above), " +
+            "--waits for off-CPU time, or --digest for takeaways."
     }
 
 /** Starts a background recording (with dump-on-exit salvage) and persists its session. */
@@ -141,7 +208,11 @@ fun CliktCommand.doStart(target: String, sessions: SessionStore) {
     val dumpOnExit = recordingsDir.resolve("session-$pid-onexit.jfr")
     Files.deleteIfExists(dumpOnExit)
 
-    JfrRecorder(pid, recordingName).startWithDumpOnExit(dumpOnExit)
+    try {
+        JfrRecorder(pid, recordingName).startWithDumpOnExit(dumpOnExit)
+    } catch (e: JcmdException) {
+        throw CliktError("Could not start background recording on pid $pid (${process.displayName}): ${e.message}")
+    }
     sessions.save(
         Session(
             pid = pid,
@@ -179,8 +250,16 @@ fun CliktCommand.doStop(
 
     val recordingFile = newRecordingPath(pid)
     val recorder = JfrRecorder(pid, session.recordingName)
-    recorder.dump(recordingFile)
-    recorder.stop()
+    try {
+        recorder.dump(recordingFile)
+        recorder.stop()
+    } catch (e: JcmdException) {
+        // Target died between the liveness check and the dump; fall back to the dump-on-exit file.
+        if (isProcessAlive(pid)) throw CliktError("Could not stop recording on pid $pid: ${e.message}")
+        sessions.delete(pid)
+        salvagePartial(session, view, format, output)
+        return
+    }
     sessions.delete(pid)
     // The live dump succeeded, so the dump-on-exit safety file is no longer needed.
     session.dumpOnExitPath?.let { runCatching { Files.deleteIfExists(Path.of(it)) } }

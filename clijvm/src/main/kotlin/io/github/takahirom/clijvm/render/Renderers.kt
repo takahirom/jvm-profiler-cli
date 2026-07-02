@@ -2,8 +2,12 @@ package io.github.takahirom.clijvm.render
 
 import io.github.takahirom.clijvm.analysis.AllocationSite
 import io.github.takahirom.clijvm.analysis.AllocationStats
+import io.github.takahirom.clijvm.analysis.HeapTrend
+import io.github.takahirom.clijvm.analysis.HeapTrendDirection
 import io.github.takahirom.clijvm.analysis.HotMethod
 import io.github.takahirom.clijvm.analysis.ProfileResult
+import io.github.takahirom.clijvm.analysis.ThreadWait
+import io.github.takahirom.clijvm.analysis.WaitStats
 import io.github.takahirom.clijvm.util.Json
 import io.github.takahirom.clijvm.util.jsonArray
 import io.github.takahirom.clijvm.util.jsonBool
@@ -47,6 +51,8 @@ data class RenderOptions(
     val siteIndex: Int? = null,
     /** Layer 2: 1-based index of the hot thread to drill into (its own top methods). */
     val threadIndex: Int? = null,
+    /** Wait/park/sleep view: render per-thread off-CPU time instead of the CPU/memory layers. */
+    val waits: Boolean = false,
 ) {
     /** True when a single node is being drilled into (Layer 2). */
     val isDrillDown: Boolean get() = methodIndex != null || siteIndex != null || threadIndex != null
@@ -115,11 +121,43 @@ object Renderers {
         }
 
         when {
+            options.waits -> appendWaitsBody(result, options)
             options.isDrillDown -> appendDrillDown(result, options)
             options.digest -> appendDigestBody(result, showMemory)
             else -> appendLayer1Body(result, options, showCpu, showMemory)
         }
     }.trimEnd('\n')
+
+    /** Wait/park/sleep view: per-thread off-CPU time, ranked, honoring --top and --max-stack-depth. */
+    private fun StringBuilder.appendWaitsBody(result: ProfileResult, options: RenderOptions) {
+        val waits = result.waits
+        if (waits == null || waits.threads.isEmpty()) {
+            appendLine("Thread waits (park/monitor-wait/sleep):")
+            appendLine("  (no wait events captured)")
+            return
+        }
+        val n = waits.threads.size
+        appendLine(
+            "Thread waits by total off-CPU time (${formatMillis(waits.totalWaitMs)} across " +
+                "$n ${if (n == 1) "thread" else "threads"}):"
+        )
+        limit(waits.threads, options.top).forEachIndexed { i, t ->
+            appendLine(
+                String.format(
+                    Locale.US,
+                    "  #%-2d %-28s total %s  (park %s/%d, wait %s/%d, sleep %s/%d)",
+                    i + 1, t.thread, formatMillis(t.totalMs),
+                    formatMillis(t.parkedMs), t.parkEvents,
+                    formatMillis(t.monitorWaitMs), t.monitorWaitEvents,
+                    formatMillis(t.sleepMs), t.sleepEvents,
+                )
+            )
+            if (t.topBlockers.isNotEmpty()) {
+                appendLine("        blockers: ${t.topBlockers.take(3).joinToString(", ")}")
+            }
+            appendStack(t.stack, options.maxStackDepth)
+        }
+    }
 
     /** Layer 0 body: headline scalars only — no hot-method / allocation-site lists, no stacks. */
     private fun StringBuilder.appendDigestBody(result: ProfileResult, showMemory: Boolean) {
@@ -136,6 +174,7 @@ object Renderers {
             }
         }
         appendClassLoading(result)
+        appendHeapTrend(result)
         appendGc(result)
     }
 
@@ -198,6 +237,7 @@ object Renderers {
         }
 
         appendClassLoading(result)
+        appendHeapTrend(result)
         appendGc(result)
     }
 
@@ -250,6 +290,40 @@ object Renderers {
         }
     }
 
+    /** One line summarising the post-GC heap trend (leak signal), when heap data was recorded. */
+    private fun StringBuilder.appendHeapTrend(result: ProfileResult) {
+        val trend = result.heapTrend ?: return
+        appendLine("Post-GC heap: ${heapTrendLine(trend)}")
+        appendLine()
+    }
+
+    private fun heapTrendLine(t: HeapTrend): String = when (t.direction) {
+        HeapTrendDirection.GROWING ->
+            "growing (~${formatBytes(t.firstThirdAvgBytes)} -> ~${formatBytes(t.lastThirdAvgBytes)}) " +
+                "over ${t.gcCount} GCs — possible leak or growing retained set"
+        HeapTrendDirection.STABLE -> "stable (~${formatBytes(t.lastThirdAvgBytes)}) over ${t.gcCount} GCs"
+        HeapTrendDirection.SHRINKING ->
+            "shrinking (~${formatBytes(t.firstThirdAvgBytes)} -> ~${formatBytes(t.lastThirdAvgBytes)}) over ${t.gcCount} GCs"
+        HeapTrendDirection.INSUFFICIENT_DATA -> "insufficient data (${t.gcCount} GCs)"
+    }
+
+    private fun heapTrendDirectionLabel(direction: HeapTrendDirection): String = when (direction) {
+        HeapTrendDirection.GROWING -> "growing"
+        HeapTrendDirection.STABLE -> "stable"
+        HeapTrendDirection.SHRINKING -> "shrinking"
+        HeapTrendDirection.INSUFFICIENT_DATA -> "insufficient-data"
+    }
+
+    private fun heapTrendJson(t: HeapTrend): Json = jsonObject(
+        "trend" to jsonString(heapTrendDirectionLabel(t.direction)),
+        "summary" to jsonString(heapTrendLine(t)),
+        "gcCount" to jsonInt(t.gcCount),
+        "firstThirdAvgBytes" to jsonInt(t.firstThirdAvgBytes),
+        "lastThirdAvgBytes" to jsonInt(t.lastThirdAvgBytes),
+        "minBytes" to jsonInt(t.minBytes),
+        "maxBytes" to jsonInt(t.maxBytes),
+    )
+
     private fun StringBuilder.appendGc(result: ProfileResult) {
         appendLine("GC:")
         appendLine("  collections:   ${result.gc.count}")
@@ -281,6 +355,12 @@ object Renderers {
         )
 
         when {
+            // Wait/park/sleep view: per-thread off-CPU time only.
+            options.waits -> {
+                entries.add(0, "layer" to jsonString("waits"))
+                entries.add("waits" to waitsJson(result.waits, options))
+            }
+
             // Layer 0: no hot-method / allocation-site arrays, just counts so a consumer knows
             // how much detail is available to drill into.
             options.digest -> {
@@ -303,6 +383,8 @@ object Renderers {
                     )
                 }
                 result.classLoading?.let { entries.add("classLoading" to classLoadingJson(result)) }
+                // Headline leak signal, so "is it leaking?" is answerable from the digest alone.
+                result.heapTrend?.let { entries.add("postGcHeap" to heapTrendJson(it)) }
             }
 
             // Layer 2: exactly the one drilled node, nothing else in the big arrays.
@@ -369,10 +451,38 @@ object Renderers {
                     entries.add("allocation" to allocationJson(allocation, sites))
                 }
                 result.classLoading?.let { entries.add("classLoading" to classLoadingJson(result)) }
+                result.heapTrend?.let { entries.add("postGcHeap" to heapTrendJson(it)) }
             }
         }
         return Json.Obj(entries).render()
     }
+
+    private fun waitsJson(waits: WaitStats?, options: RenderOptions): Json {
+        if (waits == null) return jsonObject("totalWaitMs" to jsonInt(0), "threads" to jsonArray(emptyList()))
+        val threads = limit(waits.threads, options.top).mapIndexed { i, t -> threadWaitJson(t, i + 1, options.maxStackDepth) }
+        return jsonObject(
+            "totalWaitMs" to jsonNumber(waits.totalWaitMs),
+            "threadCount" to jsonInt(waits.threads.size),
+            "threads" to jsonArray(threads),
+        )
+    }
+
+    private fun threadWaitJson(t: ThreadWait, index: Int, maxDepth: Int): Json =
+        Json.Obj(
+            buildList {
+                add("index" to jsonInt(index))
+                add("thread" to jsonString(t.thread))
+                add("totalMs" to jsonNumber(t.totalMs))
+                add("parkedMs" to jsonNumber(t.parkedMs))
+                add("monitorWaitMs" to jsonNumber(t.monitorWaitMs))
+                add("sleepMs" to jsonNumber(t.sleepMs))
+                add("parkEvents" to jsonInt(t.parkEvents))
+                add("monitorWaitEvents" to jsonInt(t.monitorWaitEvents))
+                add("sleepEvents" to jsonInt(t.sleepEvents))
+                add("topBlockers" to jsonArray(t.topBlockers.map { jsonString(it) }))
+                addAll(stackEntries(t.stack, maxDepth))
+            }
+        )
 
     private fun gcJson(result: ProfileResult): Json = jsonObject(
         "count" to jsonInt(result.gc.count),
@@ -451,6 +561,10 @@ object Renderers {
         }
         return String.format(Locale.US, "%.1f %s", value, units[index])
     }
+
+    /** Formats a millisecond duration compactly, e.g. `340 ms` or `12.3s`. */
+    fun formatMillis(ms: Double): String =
+        if (ms < 1000) String.format(Locale.US, "%.0f ms", ms) else String.format(Locale.US, "%.1fs", ms / 1000)
 
     /** Takes the first [n] items, or all of them when [n] <= 0 ("no limit"). */
     private fun <T> limit(list: List<T>, n: Int): List<T> = if (n <= 0) list else list.take(n)

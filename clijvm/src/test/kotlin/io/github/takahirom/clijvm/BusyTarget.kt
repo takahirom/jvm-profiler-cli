@@ -7,6 +7,16 @@ package io.github.takahirom.clijvm
  */
 fun main() {
     println("[target] started pid=${ProcessHandle.current().pid()}")
+
+    // A helper thread that spends its time off-CPU (parking + sleeping), so `report --waits` has
+    // something to attribute to a named thread. Daemon so it never keeps the JVM alive.
+    Thread({
+        while (true) {
+            java.util.concurrent.locks.LockSupport.parkNanos(50_000_000) // 50 ms park
+            Thread.sleep(50) // 50 ms sleep
+        }
+    }, "clijvm-waiter").apply { isDaemon = true }.start()
+
     val end = System.currentTimeMillis() + 120_000
     var acc = 0L
     while (System.currentTimeMillis() < end) {

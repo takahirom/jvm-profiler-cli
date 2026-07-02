@@ -7,8 +7,12 @@ import io.github.takahirom.clijvm.analysis.CollapsedStack
 import io.github.takahirom.clijvm.analysis.GcStats
 import io.github.takahirom.clijvm.analysis.HotMethod
 import io.github.takahirom.clijvm.analysis.HotThread
+import io.github.takahirom.clijvm.analysis.HeapTrend
+import io.github.takahirom.clijvm.analysis.HeapTrendDirection
 import io.github.takahirom.clijvm.analysis.ProfileResult
 import io.github.takahirom.clijvm.analysis.ThreadBreakdown
+import io.github.takahirom.clijvm.analysis.ThreadWait
+import io.github.takahirom.clijvm.analysis.WaitStats
 import io.github.takahirom.clijvm.cli.ReportCommand
 import io.github.takahirom.clijvm.cli.checkDrillIndex
 import io.github.takahirom.clijvm.render.OutputFormat
@@ -286,5 +290,78 @@ class RenderersTest {
         assertTrue(summary.contains("Hot thread #1: main"), summary)
         assertTrue(summary.contains("pkg.A.a"), summary)
         assertTrue(summary.contains("more frames"), summary)
+    }
+
+    private fun withWaits() = result.copy(
+        waits = WaitStats(
+            threads = listOf(
+                ThreadWait(
+                    "pool-1-thread-1", parkedMs = 12_000.0, monitorWaitMs = 2_000.0, sleepMs = 0.0,
+                    parkEvents = 100, monitorWaitEvents = 5, sleepEvents = 0,
+                    topBlockers = listOf("java.util.concurrent.locks.AbstractQueuedSynchronizer\$ConditionObject"),
+                    stack = (1..10).map { "wait.frame$it" },
+                ),
+                ThreadWait(
+                    "main", parkedMs = 0.0, monitorWaitMs = 0.0, sleepMs = 500.0,
+                    parkEvents = 0, monitorWaitEvents = 0, sleepEvents = 3, topBlockers = emptyList(), stack = emptyList(),
+                ),
+            ),
+            totalWaitMs = 14_500.0,
+        ),
+    )
+
+    @Test
+    fun `waits view renders per-thread off-CPU time in summary`() {
+        val summary = Renderers.render(withWaits(), OutputFormat.SUMMARY, ReportView.FULL, RenderOptions(waits = true, top = 1, maxStackDepth = 2))
+        assertTrue(summary.contains("Thread waits"), summary)
+        assertTrue(summary.contains("pool-1-thread-1"), summary)
+        assertTrue(summary.contains("blockers:"), summary)
+        assertFalse(summary.contains("  #2 "), summary) // top=1 shows only the top waiter
+        assertTrue(summary.contains("more frames"), summary) // 10-frame stack trimmed to 2
+    }
+
+    @Test
+    fun `waits view renders json with per-thread totals and truncation`() {
+        val json = Renderers.render(withWaits(), OutputFormat.JSON, options = RenderOptions(waits = true, maxStackDepth = 3))
+        assertTrue(json.contains("\"layer\": \"waits\""), json)
+        assertTrue(json.contains("\"thread\": \"pool-1-thread-1\""), json)
+        assertTrue(json.contains("\"parkedMs\""), json)
+        assertTrue(json.contains("\"topBlockers\""), json)
+        assertTrue(json.contains("\"stackTruncated\": true"), json)
+    }
+
+    @Test
+    fun `waits view reports absence of wait events`() {
+        val summary = Renderers.render(result, OutputFormat.SUMMARY, ReportView.FULL, RenderOptions(waits = true))
+        assertTrue(summary.contains("no wait events"), summary)
+    }
+
+    @Test
+    fun `post-GC heap trend appears in digest json and summary as a headline`() {
+        val growing = result.copy(
+            heapTrend = HeapTrend(
+                gcCount = 30, firstThirdAvgBytes = 120L * 1024 * 1024, lastThirdAvgBytes = 340L * 1024 * 1024,
+                minBytes = 100L * 1024 * 1024, maxBytes = 360L * 1024 * 1024, direction = HeapTrendDirection.GROWING,
+            ),
+        )
+        // Answerable from the digest alone (both summary and json).
+        val digestSummary = Renderers.render(growing, OutputFormat.SUMMARY, ReportView.FULL, RenderOptions(digest = true))
+        assertTrue(digestSummary.contains("Post-GC heap: growing"), digestSummary)
+
+        val digestJson = Renderers.render(growing, OutputFormat.JSON, options = RenderOptions(digest = true))
+        assertTrue(digestJson.contains("\"postGcHeap\""), digestJson)
+        assertTrue(digestJson.contains("\"trend\": \"growing\""), digestJson)
+        assertTrue(digestJson.contains("\"lastThirdAvgBytes\""), digestJson)
+
+        // Also present in the full (Layer 1) json.
+        val fullJson = Renderers.render(growing, OutputFormat.JSON, options = RenderOptions.FULL)
+        assertTrue(fullJson.contains("\"postGcHeap\""), fullJson)
+
+        // A stable heap reads as a positive signal, not a leak.
+        val stable = result.copy(
+            heapTrend = HeapTrend(20, 120L * 1024 * 1024, 121L * 1024 * 1024, 118L * 1024 * 1024, 130L * 1024 * 1024, HeapTrendDirection.STABLE),
+        )
+        val stableSummary = Renderers.render(stable, OutputFormat.SUMMARY, ReportView.FULL, RenderOptions(digest = true))
+        assertTrue(stableSummary.contains("Post-GC heap: stable"), stableSummary)
     }
 }

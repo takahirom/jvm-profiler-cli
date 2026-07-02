@@ -4,6 +4,7 @@ import com.sun.tools.attach.VirtualMachine
 import io.github.takahirom.clijvm.analysis.JfrAnalyzer
 import io.github.takahirom.clijvm.jfr.JfrRecorder
 import io.github.takahirom.clijvm.render.OutputFormat
+import io.github.takahirom.clijvm.render.RenderOptions
 import io.github.takahirom.clijvm.render.Renderers
 import java.nio.file.Files
 import java.nio.file.Path
@@ -69,6 +70,52 @@ class CpuProfilingIntegrationTest {
                 allocatedClasses.any { it.contains("String") || it.endsWith("[]") },
                 "expected a String/array type among top allocation sites but was $allocatedClasses",
             )
+        } finally {
+            child.destroyForcibly()
+            runCatching { workDir.deleteRecursively() }
+        }
+    }
+
+    @OptIn(kotlin.io.path.ExperimentalPathApi::class)
+    @Test
+    fun `captures off-CPU wait time for the parking helper thread`() {
+        val javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString()
+        val classpath = System.getProperty("java.class.path")
+        val child = ProcessBuilder(
+            javaExecutable, "-cp", classpath, "io.github.takahirom.clijvm.BusyTargetKt",
+        ).redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+
+        val workDir = Files.createTempDirectory("clijvm-waits-it")
+        try {
+            Thread.sleep(1500)
+            VirtualMachine.attach(child.pid().toString()).detach()
+
+            val recorder = JfrRecorder(child.pid())
+            recorder.start()
+            Thread.sleep(6000)
+            val recordingFile = workDir.resolve("recording.jfr")
+            recorder.dump(recordingFile)
+            recorder.stop()
+
+            val result = JfrAnalyzer.analyze(recordingFile, pid = child.pid())
+            val waits = result.waits
+            assertTrue(waits != null, "expected wait/park/sleep events to be captured")
+            val waiter = waits!!.threads.firstOrNull { it.thread == "clijvm-waiter" }
+            assertTrue(
+                waiter != null,
+                "expected the clijvm-waiter thread in waits but saw ${waits.threads.map { it.thread }}",
+            )
+            assertTrue(
+                waiter!!.parkedMs > 0 || waiter.sleepMs > 0,
+                "expected park or sleep time for clijvm-waiter but was $waiter",
+            )
+            // And it must render in the --waits view.
+            val waitsReport = Renderers.render(
+                result, OutputFormat.SUMMARY, options = RenderOptions(waits = true),
+            )
+            assertTrue(waitsReport.contains("clijvm-waiter"), waitsReport)
         } finally {
             child.destroyForcibly()
             runCatching { workDir.deleteRecursively() }

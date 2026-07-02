@@ -43,10 +43,15 @@ object JfrAnalyzer {
         val sampleAllocations = ArrayList<AllocationRecord>()
         val tlabAllocations = ArrayList<AllocationRecord>()
 
+        // Wait/park/sleep events, aggregated per thread for the `report --waits` view.
+        val waitByThread = HashMap<String, WaitAcc>()
+
         var totalSamples = 0
         var gcCount = 0
         var gcTotalMs = 0.0
         var gcMaxMs = 0.0
+        // Live-heap size after each GC, in recording order, for the leak/heap-trend signal.
+        val postGcHeapUsed = ArrayList<Long>()
         var minTime: Instant? = null
         var maxTime: Instant? = null
 
@@ -98,6 +103,16 @@ object JfrAnalyzer {
                         allocationRecord(event, "weight")?.let { sampleAllocations.add(it) }
                     "jdk.ObjectAllocationInNewTLAB", "jdk.ObjectAllocationOutsideTLAB" ->
                         allocationRecord(event, "allocationSize")?.let { tlabAllocations.add(it) }
+                    "jdk.GCHeapSummary" -> {
+                        // "After GC" heapUsed is the live set once dead objects are collected.
+                        val phase = runCatching { event.getString("when") }.getOrNull()
+                        if (phase == "After GC") {
+                            runCatching { event.getLong("heapUsed") }.getOrNull()?.let { postGcHeapUsed.add(it) }
+                        }
+                    }
+                    "jdk.ThreadPark" -> accumulateWait(waitByThread, event, WaitKind.PARK, "parkedClass")
+                    "jdk.JavaMonitorWait" -> accumulateWait(waitByThread, event, WaitKind.MONITOR, "monitorClass")
+                    "jdk.ThreadSleep" -> accumulateWait(waitByThread, event, WaitKind.SLEEP, classField = null)
                     "jdk.ClassLoadingStatistics" -> {
                         val loaded = runCatching { event.getLong("loadedClassCount") }.getOrNull()
                         if (loaded != null) {
@@ -165,6 +180,12 @@ object JfrAnalyzer {
         val allocation = aggregateAllocation("jdk.ObjectAllocationSample", sampleAllocations, topN)
             ?: aggregateAllocation("jdk.ObjectAllocationInNewTLAB/OutsideTLAB", tlabAllocations, topN)
 
+        // Threads ranked by total wait time; null when the recording had no wait events.
+        val waitThreads = waitByThread.entries
+            .map { (name, acc) -> acc.toThreadWait(name) }
+            .sortedByDescending { it.totalMs }
+        val waits = if (waitThreads.isEmpty()) null else WaitStats(waitThreads, waitThreads.sumOf { it.totalMs })
+
         val classLoading = lastLoadedCount?.let { last ->
             ClassLoadingStats(
                 loadedClassCount = last,
@@ -185,6 +206,8 @@ object JfrAnalyzer {
             collapsed = collapsed,
             allocation = allocation,
             classLoading = classLoading,
+            waits = waits,
+            heapTrend = HeapTrendAnalysis.derive(postGcHeapUsed),
             recordingPath = file.toAbsolutePath().toString(),
             partial = partial,
         )
@@ -212,4 +235,61 @@ object JfrAnalyzer {
 
     private fun percentage(part: Int, total: Int): Double =
         if (total == 0) 0.0 else 100.0 * part / total
+
+    private enum class WaitKind { PARK, MONITOR, SLEEP }
+
+    /** Mutable per-thread accumulator for wait/park/sleep events. */
+    private class WaitAcc {
+        var parkedMs = 0.0
+        var monitorWaitMs = 0.0
+        var sleepMs = 0.0
+        var parkEvents = 0
+        var monitorWaitEvents = 0
+        var sleepEvents = 0
+        val blockerCounts = HashMap<String, Int>()
+        var longestMs = -1.0
+        var stack: List<String> = emptyList()
+
+        fun toThreadWait(name: String) = ThreadWait(
+            thread = name,
+            parkedMs = parkedMs,
+            monitorWaitMs = monitorWaitMs,
+            sleepMs = sleepMs,
+            parkEvents = parkEvents,
+            monitorWaitEvents = monitorWaitEvents,
+            sleepEvents = sleepEvents,
+            topBlockers = blockerCounts.entries.sortedByDescending { it.value }.map { it.key },
+            stack = stack,
+        )
+    }
+
+    /** Folds one wait event into [waitByThread], attributing it to the event's own thread. */
+    private fun accumulateWait(
+        waitByThread: HashMap<String, WaitAcc>,
+        event: RecordedEvent,
+        kind: WaitKind,
+        classField: String?,
+    ) {
+        val durationMs = event.duration.toNanos() / 1_000_000.0
+        // For these events the event thread IS the waiting thread (unlike ExecutionSample).
+        val thread = event.thread?.javaName?.takeIf { it.isNotBlank() }
+            ?: event.thread?.osName
+            ?: "(unknown thread)"
+        val acc = waitByThread.getOrPut(thread) { WaitAcc() }
+        when (kind) {
+            WaitKind.PARK -> { acc.parkedMs += durationMs; acc.parkEvents++ }
+            WaitKind.MONITOR -> { acc.monitorWaitMs += durationMs; acc.monitorWaitEvents++ }
+            WaitKind.SLEEP -> { acc.sleepMs += durationMs; acc.sleepEvents++ }
+        }
+        classField?.let { field ->
+            runCatching { event.getClass(field) }.getOrNull()?.let { c ->
+                acc.blockerCounts.merge(readableClassName(c.name), 1, Int::plus)
+            }
+        }
+        // Keep the stack from this thread's single longest wait as its representative.
+        if (durationMs > acc.longestMs) {
+            acc.longestMs = durationMs
+            acc.stack = event.stackTrace?.frames?.take(MAX_STACK_DEPTH)?.map { formatFrame(it) }.orEmpty()
+        }
+    }
 }

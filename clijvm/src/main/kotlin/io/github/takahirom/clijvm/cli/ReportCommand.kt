@@ -47,6 +47,7 @@ class ReportCommand : CliktCommand(
           3. clijvm report --last --method 3      # one hot method with its full stack
 
         The #N labels printed in step 2 are the indices you pass to --method / --site / --thread.
+        Where does non-CPU time go? -> clijvm report --last --waits (per-thread park/wait/sleep).
     """.trimIndent(),
 ) {
     private val last by option("--last", help = "Use the newest recording in ~/.clijvm/recordings.").flag()
@@ -82,6 +83,10 @@ class ReportCommand : CliktCommand(
         "--thread",
         help = "Layer 2 — drill into one hot thread by its #N index, showing its own top methods.",
     ).int()
+    private val waits by option(
+        "--waits",
+        help = "Wait view — per-thread off-CPU time (park/monitor-wait/sleep). Honors --top and --max-stack-depth.",
+    ).flag()
     private val full by option(
         "--full",
         help = "Escape hatch — render everything with full stacks (same as --top 0 --max-stack-depth 0).",
@@ -128,6 +133,7 @@ class ReportCommand : CliktCommand(
             methodIndex = methodIndex,
             siteIndex = siteIndex,
             threadIndex = threadIndex,
+            waits = waits,
         )
     }
 

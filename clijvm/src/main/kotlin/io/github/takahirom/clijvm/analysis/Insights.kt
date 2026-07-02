@@ -22,6 +22,9 @@ object InsightRules {
     /** Below this sampling rate (samples/sec), the target looks mostly idle. */
     const val IDLE_SAMPLES_PER_SEC = 20.0
 
+    /** If one thread holds at least this share of CPU samples, the process isn't idle — it's single-threaded. */
+    const val BUSY_THREAD_SHARE_PCT = 70.0
+
     /** GC pause share of wall-clock time considered worth flagging. */
     const val GC_PAUSE_SHARE = 0.10
 
@@ -65,17 +68,23 @@ object InsightRules {
         if (seconds > 0 && result.totalSamples > 0) {
             val samplesPerSec = result.totalSamples / seconds
             if (samplesPerSec < IDLE_SAMPLES_PER_SEC) {
-                // JFR execution samples can't fire during stop-the-world GC pauses, so a GC-heavy
-                // run looks "idle". When GC explains the low rate, say so instead of blaming idleness.
-                warnings += if (gcShare >= GC_PAUSE_SHARE) {
-                    String.format(
+                val topThread = result.hotThreads.maxByOrNull { it.cpuPct }
+                // Precedence: GC pauses (samples can't fire during STW) > a single busy thread
+                // (process is single-threaded, not idle) > plain idle.
+                warnings += when {
+                    gcShare >= GC_PAUSE_SHARE -> String.format(
                         Locale.US,
                         "Low sample rate is likely due to GC pauses (GC accounted for %.0f%% of the " +
                             "recording), not an idle target.",
                         gcShare * 100,
                     )
-                } else {
-                    String.format(
+                    topThread != null && topThread.cpuPct >= BUSY_THREAD_SHARE_PCT -> String.format(
+                        Locale.US,
+                        "Process-wide sample rate is low (~%.1f/s), but '%s' is busy (%.0f%% of samples) — " +
+                            "the idle time is in helper threads.",
+                        samplesPerSec, topThread.name, topThread.cpuPct,
+                    )
+                    else -> String.format(
                         Locale.US,
                         "Target looks mostly idle (~%.1f CPU samples/sec); hotspots may not reflect real work.",
                         samplesPerSec,
@@ -143,7 +152,44 @@ object InsightRules {
             )
         }
 
+        // --- post-GC heap growth (possible leak) ---
+        result.heapTrend?.let { trend ->
+            if (trend.direction == HeapTrendDirection.GROWING) {
+                hints += "Post-GC heap grew from ~${formatBytes(trend.firstThirdAvgBytes)} to " +
+                    "~${formatBytes(trend.lastThirdAvgBytes)} over the recording (${trend.gcCount} GCs); " +
+                    "possible leak or growing retained set."
+            }
+            // Flat/shrinking heap is surfaced as a positive digest signal by the renderer, not a hint.
+        }
+
+        // --- significant non-CPU (wait/park/sleep) time ---
+        result.waits?.let { waits ->
+            val maxThreadWaitMs = waits.threads.maxOfOrNull { it.totalMs } ?: 0.0
+            // Flag when at least one thread spent half the recording parked/waiting.
+            if (result.durationMs > 0 && maxThreadWaitMs >= 0.5 * result.durationMs) {
+                hints += String.format(
+                    Locale.US,
+                    "Threads spent significant time off-CPU (up to %.1fs parked/waiting on one thread); " +
+                        "run 'report --waits' to see where non-CPU time went.",
+                    maxThreadWaitMs / 1000.0,
+                )
+            }
+        }
+
         return Insights(warnings, hints)
+    }
+
+    /** Compact binary-scaled byte label (e.g. `120 MB`) for hint text; mirrors the renderer's format. */
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val units = listOf("KB", "MB", "GB", "TB")
+        var value = bytes.toDouble() / 1024
+        var index = 0
+        while (value >= 1024 && index < units.lastIndex) {
+            value /= 1024
+            index++
+        }
+        return String.format(Locale.US, "%.1f %s", value, units[index])
     }
 
     /**
