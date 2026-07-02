@@ -79,7 +79,7 @@ fun CliktCommand.profileSynchronously(
             val result = JfrAnalyzer.analyze(recordingFile, pid, process.displayName, durationMs)
             echo("Recording saved to $recordingFile")
             writeReport(Renderers.render(result, format, view, renderOptions), output)
-            echoDrillGuidance(recordingFile, format, output)
+            echoDrillGuidance(recordingFile, format, output, renderOptions.digest)
         }
     }
 
@@ -97,13 +97,29 @@ fun CliktCommand.profileSynchronously(
 /**
  * Prints one self-teaching line pointing at the drill-down commands, in the same style as
  * `report`. Only for a summary printed to stdout — it must not corrupt json/collapsed or a file.
+ * In digest mode there are no #N indices yet, so it points at the default report first.
  */
-private fun CliktCommand.echoDrillGuidance(recording: Path, format: OutputFormat, output: String?) {
+private fun CliktCommand.echoDrillGuidance(
+    recording: Path,
+    format: OutputFormat,
+    output: String?,
+    digest: Boolean,
+) {
     if (format != OutputFormat.SUMMARY || output != null) return
-    echo(
-        "Drill in: clijvm report $recording --method N (see #N above), or --digest for takeaways."
-    )
+    echo(drillGuidance(recording.toString(), digest))
 }
+
+/**
+ * Builds the self-teaching drill-down line. Digest output carries no #N indices yet, so it points
+ * at the default report first; the non-digest line references the #N labels already printed.
+ */
+internal fun drillGuidance(recording: String, digest: Boolean): String =
+    if (digest) {
+        "Drill in: run 'clijvm report $recording' first to get #N indices, " +
+            "then --method N / --site N / --thread N."
+    } else {
+        "Drill in: clijvm report $recording --method N (see #N above), or --digest for takeaways."
+    }
 
 /** Starts a background recording (with dump-on-exit salvage) and persists its session. */
 fun CliktCommand.doStart(target: String, sessions: SessionStore) {

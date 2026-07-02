@@ -147,15 +147,16 @@ class ReportCommand : CliktCommand(
         }
         if (recordings.isEmpty()) return "No recordings found in $recordingsDir."
         val pidWidth = maxOf(3, recordings.maxOf { (it.pid?.toString() ?: "-").length })
+        val fileWidth = maxOf(4, recordings.maxOf { it.file.fileName.toString().length })
+        val row = "%-19s  %-${pidWidth}s  %-9s  %-${fileWidth}s  %s"
         return buildString {
-            appendLine("%-19s  %-${pidWidth}s  %-9s  %s".format("TIMESTAMP", "PID", "SIZE", "MAIN CLASS / FILE"))
+            appendLine(row.format("TIMESTAMP", "PID", "SIZE", "FILE", "MAIN CLASS"))
             recordings.forEach { r ->
                 val pid = r.pid?.toString() ?: "-"
-                // Truncate the label so a daemon's full classpath doesn't blow up the table (JSON keeps it whole).
-                val label = truncateDisplayName(r.mainClass ?: r.file.fileName.toString(), full = false).first
+                val mainClass = recordingMainClassCell(r.mainClass)
                 appendLine(
-                    "%-19s  %-${pidWidth}s  %-9s  %s".format(
-                        r.timestamp, pid, Renderers.formatBytes(r.sizeBytes), label,
+                    row.format(
+                        r.timestamp, pid, Renderers.formatBytes(r.sizeBytes), r.file.fileName.toString(), mainClass,
                     )
                 )
             }
@@ -204,3 +205,11 @@ internal fun checkDrillIndex(flag: String, label: String, index: Int, size: Int)
     if (size == 0) throw CliktError("This recording has no $label to drill into.")
     if (index !in 1..size) throw CliktError("$flag must be between 1 and $size (got $index).")
 }
+
+/**
+ * The MAIN CLASS cell for `report --list`: the main class truncated like `list` does (so a daemon's
+ * classpath doesn't blow up the row), or `(unknown)` when no sidecar recorded it. The FILE column
+ * keeps the recording identifiable, so the filename never needs to stand in here.
+ */
+internal fun recordingMainClassCell(mainClass: String?): String =
+    mainClass?.let { truncateDisplayName(it, full = false).first } ?: "(unknown)"

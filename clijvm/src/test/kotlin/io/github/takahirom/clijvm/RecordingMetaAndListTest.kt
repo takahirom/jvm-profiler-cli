@@ -1,6 +1,8 @@
 package io.github.takahirom.clijvm
 
 import io.github.takahirom.clijvm.cli.MAX_DISPLAY_NAME
+import io.github.takahirom.clijvm.cli.drillGuidance
+import io.github.takahirom.clijvm.cli.recordingMainClassCell
 import io.github.takahirom.clijvm.cli.truncateDisplayName
 import io.github.takahirom.clijvm.util.RecordingMeta
 import io.github.takahirom.clijvm.util.readRecordingMeta
@@ -55,6 +57,29 @@ class RecordingMetaAndListTest {
         } finally {
             dir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `drill guidance branches on digest mode`() {
+        val nonDigest = drillGuidance("/tmp/rec.jfr", digest = false)
+        assertTrue(nonDigest.contains("--method N (see #N above)"), nonDigest)
+        assertFalse(nonDigest.contains("first to get #N indices"), nonDigest)
+
+        val digest = drillGuidance("/tmp/rec.jfr", digest = true)
+        // Digest has no #N indices yet, so it must not claim they were printed above.
+        assertFalse(digest.contains("see #N above"), digest)
+        assertTrue(digest.contains("first to get #N indices"), digest)
+        assertTrue(digest.contains("--method N / --site N / --thread N"), digest)
+    }
+
+    @Test
+    fun `report list main-class cell truncates and falls back to unknown`() {
+        assertEquals("(unknown)", recordingMainClassCell(null))
+        assertEquals("com.example.Main", recordingMainClassCell("com.example.Main"))
+        val long = "x".repeat(MAX_DISPLAY_NAME + 50)
+        val cell = recordingMainClassCell(long)
+        assertTrue(cell.endsWith("…"), cell)
+        assertEquals(MAX_DISPLAY_NAME + 1, cell.length)
     }
 
     @OptIn(kotlin.io.path.ExperimentalPathApi::class)
