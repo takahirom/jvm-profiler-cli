@@ -33,7 +33,7 @@ clijvm cpu start|stop|status <target>             # background recording (see be
 clijvm memory <target> [--duration 30s]           # synchronous allocation profile
 clijvm memory start|stop|status <target>          # background recording (shares cpu's recording)
 clijvm heap <target> [--limit 20] [--format ...]  # class histogram (jcmd GC.class_histogram)
-clijvm report [--last | <file.jfr>] [--format ...] # re-analyse a saved recording, no re-profiling
+clijvm report [--last | <file.jfr>] [--format ...] # re-analyse a saved recording (layered; see below)
 ```
 
 - **`<target>`** is a pid, or a case-insensitive substring of a process display name. Ambiguous
@@ -45,17 +45,48 @@ clijvm report [--last | <file.jfr>] [--format ...] # re-analyse a saved recordin
   samples and allocation events, so `cpu start` then `memory stop` on the same pid works and reports
   allocations. Background session state lives in `~/.clijvm/sessions/<pid>.json`.
 
-## Recommended AI workflow
+## Layered reports (progressive disclosure)
+
+A full JSON report can be ~40k+ tokens — 20 hot methods and 20 allocation sites, each with a deep
+stack. That's too much to read all at once. `report` is **layered** so an AI can read cheaply, then
+drill only into what matters. `report --help` teaches the whole workflow on its own:
+
+1. **Layer 0 — `--digest`**: takeaways only. Warnings, hints, and headline numbers (pid, duration,
+   samples, GC, class loading, allocation totals). No hot-method/allocation lists, no stacks.
+   ```bash
+   clijvm report --last --digest             # ~1 KB
+   ```
+2. **Layer 1 — the default**: the top hot methods/threads/sites (numbered `#1`, `#2`, …) with
+   shallow stacks. `--top N` (default 5) and `--max-stack-depth D` (default 5) control the size. A
+   trimmed stack is flagged — `… (23 more frames)` in summary, `"stackTruncated": true` /
+   `"stackFrameTotal": 28` in JSON — so you know when to drill.
+   ```bash
+   clijvm report --last                      # top 5, 5-frame stacks (~5% the size of --full)
+   clijvm report --last --top 10 --format json
+   ```
+3. **Layer 2 — drill-down**: `--method N` / `--site N` (the `#N` from Layer 1) print exactly that one
+   node with its **full** stack.
+   ```bash
+   clijvm report --last --method 3           # one hot method, full stack
+   clijvm report --last --site 1             # one allocation site, full stack
+   ```
+
+Escape hatch: **`--full`** (equivalently `--top 0 --max-stack-depth 0`) renders everything with full
+stacks, i.e. the pre-layering behaviour.
+
+`warnings`/`hints` come first in every layer, so the agent sees the takeaways before the raw data.
+`--digest`, `--top`, and `--max-stack-depth` also work on the synchronous `cpu`/`memory` commands;
+the drill-down `--method`/`--site` are `report`-only (you need Layer 1's indices first).
+
+`collapsed` output (`frame;frame;count`, root-first) is a flamegraph-compatible view; `--top` and
+`--max-stack-depth` trim it too.
+
+### Recommended AI workflow
 
 1. Profile: `clijvm cpu <target> --duration 20s` (or `memory`, or `heap`).
-2. Re-emit as JSON: `clijvm report --last --format json`.
-3. Feed that JSON to your AI agent. It contains `warnings` (confidence caveats), `hints`
-   (actionable one-liners), `cpu.hotMethods` with self%, `cpu.hotThreads`, `gc`, `allocation`
-   (when present), and `classLoading`. The `warnings`/`hints` arrays come first so the agent sees
-   the takeaways before the raw data.
-
-`collapsed` output (`frame;frame;count`, root-first) is a flamegraph-compatible view an agent can
-also read stack-by-stack.
+2. Read the takeaways: `clijvm report --last --digest`.
+3. Skim the hotspots: `clijvm report --last --format json` (top 5, shallow stacks).
+4. Drill where it matters: `clijvm report --last --method <#N>` (or `--site <#N>`).
 
 ## Profiling Gradle test workers (Robolectric)
 

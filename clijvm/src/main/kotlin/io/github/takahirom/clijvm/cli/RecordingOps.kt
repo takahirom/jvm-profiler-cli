@@ -7,6 +7,7 @@ import io.github.takahirom.clijvm.attach.JvmProcess
 import io.github.takahirom.clijvm.attach.ProcessWaiter
 import io.github.takahirom.clijvm.jfr.JfrRecorder
 import io.github.takahirom.clijvm.render.OutputFormat
+import io.github.takahirom.clijvm.render.RenderOptions
 import io.github.takahirom.clijvm.render.Renderers
 import io.github.takahirom.clijvm.render.ReportView
 import io.github.takahirom.clijvm.session.Session
@@ -51,6 +52,7 @@ fun CliktCommand.profileSynchronously(
     view: ReportView,
     format: OutputFormat,
     output: String?,
+    renderOptions: RenderOptions = RenderOptions.DEFAULT,
 ) {
     val pid = process.pid
     verifyAttach(pid, process.displayName)
@@ -70,7 +72,7 @@ fun CliktCommand.profileSynchronously(
             val durationMs = System.currentTimeMillis() - startedAt
             val result = JfrAnalyzer.analyze(recordingFile, pid, process.displayName, durationMs)
             echo("Recording saved to $recordingFile")
-            writeReport(Renderers.render(result, format, view), output)
+            writeReport(Renderers.render(result, format, view, renderOptions), output)
         }
     }
 
