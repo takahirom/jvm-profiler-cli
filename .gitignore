@@ -1,0 +1,7 @@
+.idea
+PLAN.md
+build/
+*.iml
+.gradle
+.kotlin/
+.DS_Store
