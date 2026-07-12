@@ -181,7 +181,9 @@ EOF
         --allowedTools "Bash(clijvm:*)" "Bash(jps:*)" \
       ) > "$raw_json" 2>"$err_log" &
     local agent_pid=$!
-    ( sleep "$AGENT_TIMEOUT_SECS" && kill "$agent_pid" 2>/dev/null ) &
+    # SIGTERM first, then SIGKILL after a grace period in case the agent ignores it.
+    ( sleep "$AGENT_TIMEOUT_SECS" && kill "$agent_pid" 2>/dev/null \
+        && sleep 10 && kill -9 "$agent_pid" 2>/dev/null ) &
     local watchdog_pid=$!
     wait "$agent_pid"
     local agent_rc=$?
