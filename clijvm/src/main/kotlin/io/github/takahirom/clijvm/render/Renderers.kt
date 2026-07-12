@@ -2,9 +2,12 @@ package io.github.takahirom.clijvm.render
 
 import io.github.takahirom.clijvm.analysis.AllocationSite
 import io.github.takahirom.clijvm.analysis.AllocationStats
+import io.github.takahirom.clijvm.analysis.ContendedMonitor
 import io.github.takahirom.clijvm.analysis.HeapTrend
 import io.github.takahirom.clijvm.analysis.HeapTrendDirection
 import io.github.takahirom.clijvm.analysis.HotMethod
+import io.github.takahirom.clijvm.analysis.InsightRules
+import io.github.takahirom.clijvm.analysis.LockContentionStats
 import io.github.takahirom.clijvm.analysis.ProfileResult
 import io.github.takahirom.clijvm.analysis.ThreadWait
 import io.github.takahirom.clijvm.analysis.WaitStats
@@ -115,8 +118,15 @@ object Renderers {
             appendLine()
         }
         if (result.hints.isNotEmpty()) {
-            appendLine("Hints:")
-            result.hints.forEach { appendLine("  * $it") }
+            // In secondary views (waits, drill-downs) the hints were already shown in the main
+            // report; collapse them to a one-line pointer so re-reading a view is cheap. The full
+            // preamble (with hint text) stays on digest and Layer-1, and in JSON for all views.
+            if (options.waits || options.isDrillDown) {
+                appendLine("Hints: ${result.hints.size} (shown in the main report)")
+            } else {
+                appendLine("Hints:")
+                result.hints.forEach { appendLine("  * $it") }
+            }
             appendLine()
         }
 
@@ -130,6 +140,8 @@ object Renderers {
 
     /** Wait/park/sleep view: per-thread off-CPU time, ranked, honoring --top and --max-stack-depth. */
     private fun StringBuilder.appendWaitsBody(result: ProfileResult, options: RenderOptions) {
+        // Contended locks first: a serialization point is usually the more actionable finding.
+        appendContendedLocks(result, options)
         val waits = result.waits
         if (waits == null || waits.threads.isEmpty()) {
             appendLine("Thread waits (park/monitor-wait/sleep):")
@@ -159,6 +171,35 @@ object Renderers {
         }
     }
 
+    /** Contended-monitor section for the `--waits` view; no-op when no monitor-enter events. */
+    private fun StringBuilder.appendContendedLocks(result: ProfileResult, options: RenderOptions) {
+        val lc = result.lockContention ?: return
+        if (lc.monitors.isEmpty()) return
+        val n = lc.monitors.size
+        appendLine(
+            "Contended locks by total blocked time (${formatMillis(lc.totalBlockedMs)} across " +
+                "$n ${if (n == 1) "monitor" else "monitors"}):"
+        )
+        limit(lc.monitors, options.top).forEachIndexed { i, m ->
+            val owner = m.ownerThread?.let { ", owner $it" } ?: ""
+            // Estimated (sampled) figures get a `~` and a marker so they aren't read as exact.
+            val prefix = if (m.estimated) "~" else ""
+            val marker = if (m.estimated) ", sampled" else ""
+            appendLine(
+                String.format(
+                    Locale.US,
+                    "  #%-2d %-36s total %s%s  (%d events%s%s)",
+                    i + 1, m.className, prefix, formatMillis(m.totalBlockedMs), m.events, owner, marker,
+                )
+            )
+            if (m.topBlockedThreads.isNotEmpty()) {
+                appendLine("        blocked: ${m.topBlockedThreads.take(3).joinToString(", ")}")
+            }
+            appendStack(m.stack, options.maxStackDepth)
+        }
+        appendLine()
+    }
+
     /** Layer 0 body: headline scalars only — no hot-method / allocation-site lists, no stacks. */
     private fun StringBuilder.appendDigestBody(result: ProfileResult, showMemory: Boolean) {
         appendLine("Digest (takeaways only). For details: 'report --last', then '--method N' / '--site N'.")
@@ -186,6 +227,10 @@ object Renderers {
         showMemory: Boolean,
     ) {
         if (showCpu) {
+            // When the wall-clock is dominated by off-CPU time, lead with the off-CPU breakdown so
+            // the reader doesn't spend a round-trip on the CPU axis before discovering the truth.
+            appendOffCpuAxis(result, options)
+
             appendLine("Top hot methods (self%):")
             if (result.hotMethods.isEmpty()) {
                 appendLine("  (no CPU samples captured)")
@@ -239,6 +284,36 @@ object Renderers {
         appendClassLoading(result)
         appendHeapTrend(result)
         appendGc(result)
+    }
+
+    /**
+     * Off-CPU lead-in for Layer 1: a compact off-CPU summary (no stacks) rendered before the hot
+     * methods when the target is off-CPU-dominated. Saves a wasted CPU-axis round-trip.
+     */
+    private fun StringBuilder.appendOffCpuAxis(result: ProfileResult, options: RenderOptions) {
+        if (!InsightRules.isOffCpuDominant(result)) return
+        val waits = result.waits ?: return
+        appendLine("Off-CPU (dominant):")
+        limit(waits.threads, 3).forEach { t ->
+            val blocker = t.topBlockers.firstOrNull()?.let { "; first blocker $it" } ?: ""
+            appendLine(
+                String.format(
+                    Locale.US,
+                    "  %-28s total %s  (park %s, wait %s, sleep %s)%s",
+                    t.thread, formatMillis(t.totalMs),
+                    formatMillis(t.parkedMs), formatMillis(t.monitorWaitMs), formatMillis(t.sleepMs),
+                    blocker,
+                )
+            )
+        }
+        if (InsightRules.isLockContentionSignificant(result)) {
+            val top = result.lockContention!!.monitors.first()
+            val owner = top.ownerThread?.let { " (owner $it)" } ?: ""
+            val prefix = if (top.estimated) "~" else ""
+            appendLine("  contended lock '${top.className}': blocked $prefix${formatMillis(top.totalBlockedMs)}$owner")
+        }
+        appendLine("Full breakdown: report --last --waits")
+        appendLine()
     }
 
     /** Layer 2 body: exactly one hot method or allocation site, with its full stack. */
@@ -359,6 +434,7 @@ object Renderers {
             options.waits -> {
                 entries.add(0, "layer" to jsonString("waits"))
                 entries.add("waits" to waitsJson(result.waits, options))
+                result.lockContention?.let { entries.add("lockContention" to lockContentionJson(it, options)) }
             }
 
             // Layer 0: no hot-method / allocation-site arrays, just counts so a consumer knows
@@ -383,6 +459,9 @@ object Renderers {
                     )
                 }
                 result.classLoading?.let { entries.add("classLoading" to classLoadingJson(result)) }
+                // Compact contention headline (totals + top monitor), answerable from the digest alone.
+                result.lockContention?.takeIf { it.monitors.isNotEmpty() }
+                    ?.let { entries.add("lockContention" to lockContentionDigestJson(it)) }
                 // Headline leak signal, so "is it leaking?" is answerable from the digest alone.
                 result.heapTrend?.let { entries.add("postGcHeap" to heapTrendJson(it)) }
             }
@@ -451,6 +530,8 @@ object Renderers {
                     entries.add("allocation" to allocationJson(allocation, sites))
                 }
                 result.classLoading?.let { entries.add("classLoading" to classLoadingJson(result)) }
+                result.lockContention?.takeIf { it.monitors.isNotEmpty() }
+                    ?.let { entries.add("lockContention" to lockContentionDigestJson(it)) }
                 result.heapTrend?.let { entries.add("postGcHeap" to heapTrendJson(it)) }
             }
         }
@@ -481,6 +562,47 @@ object Renderers {
                 add("sleepEvents" to jsonInt(t.sleepEvents))
                 add("topBlockers" to jsonArray(t.topBlockers.map { jsonString(it) }))
                 addAll(stackEntries(t.stack, maxDepth))
+            }
+        )
+
+    /** Full lock-contention JSON for the `--waits` view: totals plus per-monitor detail with stacks. */
+    private fun lockContentionJson(lc: LockContentionStats, options: RenderOptions): Json {
+        val monitors = limit(lc.monitors, options.top)
+            .mapIndexed { i, m -> contendedMonitorJson(m, i + 1, options.maxStackDepth) }
+        return jsonObject(
+            "totalBlockedMs" to jsonNumber(lc.totalBlockedMs),
+            "monitorCount" to jsonInt(lc.monitors.size),
+            "monitors" to jsonArray(monitors),
+        )
+    }
+
+    /** Compact lock-contention JSON for Layer-1/digest: totals plus the single top monitor. */
+    private fun lockContentionDigestJson(lc: LockContentionStats): Json {
+        val top = lc.monitors.first()
+        return jsonObject(
+            "totalBlockedMs" to jsonNumber(lc.totalBlockedMs),
+            "monitorCount" to jsonInt(lc.monitors.size),
+            "topMonitor" to jsonObject(
+                "class" to jsonString(top.className),
+                "totalBlockedMs" to jsonNumber(top.totalBlockedMs),
+                "events" to jsonInt(top.events),
+                "ownerThread" to jsonStringOrNull(top.ownerThread),
+                "estimated" to jsonBool(top.estimated),
+            ),
+        )
+    }
+
+    private fun contendedMonitorJson(m: ContendedMonitor, index: Int, maxDepth: Int): Json =
+        Json.Obj(
+            buildList {
+                add("index" to jsonInt(index))
+                add("class" to jsonString(m.className))
+                add("totalBlockedMs" to jsonNumber(m.totalBlockedMs))
+                add("events" to jsonInt(m.events))
+                add("topBlockedThreads" to jsonArray(m.topBlockedThreads.map { jsonString(it) }))
+                add("ownerThread" to jsonStringOrNull(m.ownerThread))
+                add("estimated" to jsonBool(m.estimated))
+                addAll(stackEntries(m.stack, maxDepth))
             }
         )
 

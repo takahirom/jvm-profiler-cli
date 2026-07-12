@@ -4,11 +4,13 @@ import io.github.takahirom.clijvm.analysis.AllocationSite
 import io.github.takahirom.clijvm.analysis.AllocationStats
 import io.github.takahirom.clijvm.analysis.ClassLoadingStats
 import io.github.takahirom.clijvm.analysis.CollapsedStack
+import io.github.takahirom.clijvm.analysis.ContendedMonitor
 import io.github.takahirom.clijvm.analysis.GcStats
 import io.github.takahirom.clijvm.analysis.HotMethod
 import io.github.takahirom.clijvm.analysis.HotThread
 import io.github.takahirom.clijvm.analysis.HeapTrend
 import io.github.takahirom.clijvm.analysis.HeapTrendDirection
+import io.github.takahirom.clijvm.analysis.LockContentionStats
 import io.github.takahirom.clijvm.analysis.ProfileResult
 import io.github.takahirom.clijvm.analysis.ThreadBreakdown
 import io.github.takahirom.clijvm.analysis.ThreadWait
@@ -334,6 +336,183 @@ class RenderersTest {
     fun `waits view reports absence of wait events`() {
         val summary = Renderers.render(result, OutputFormat.SUMMARY, ReportView.FULL, RenderOptions(waits = true))
         assertTrue(summary.contains("no wait events"), summary)
+    }
+
+    // ---- lock contention ---------------------------------------------------------------------
+
+    private fun withLockContention() = withWaits().copy(
+        lockContention = LockContentionStats(
+            monitors = listOf(
+                ContendedMonitor(
+                    className = "com.example.SharedLedger", totalBlockedMs = 12_400.0, events = 210,
+                    topBlockedThreads = listOf("worker-1", "worker-2"), ownerThread = "db-writer",
+                    stack = (1..10).map { "lock.frame$it" },
+                ),
+            ),
+            totalBlockedMs = 12_400.0,
+        ),
+    )
+
+    @Test
+    fun `waits view renders a contended locks section above the thread waits`() {
+        val summary = Renderers.render(
+            withLockContention(), OutputFormat.SUMMARY, ReportView.FULL,
+            RenderOptions(waits = true, top = 1, maxStackDepth = 2),
+        )
+        assertTrue(summary.contains("Contended locks"), summary)
+        assertTrue(summary.contains("com.example.SharedLedger"), summary)
+        assertTrue(summary.contains("owner db-writer"), summary)
+        assertTrue(summary.contains("blocked: worker-1"), summary)
+        assertTrue(summary.contains("more frames"), summary) // 10-frame stack trimmed to 2
+        assertTrue(summary.indexOf("Contended locks") < summary.indexOf("Thread waits"), summary)
+    }
+
+    @Test
+    fun `waits json carries the full lockContention object`() {
+        val json = Renderers.render(
+            withLockContention(), OutputFormat.JSON, options = RenderOptions(waits = true, maxStackDepth = 3),
+        )
+        assertTrue(json.contains("\"lockContention\""), json)
+        assertTrue(json.contains("\"class\": \"com.example.SharedLedger\""), json)
+        assertTrue(json.contains("\"ownerThread\": \"db-writer\""), json)
+        assertTrue(json.contains("\"totalBlockedMs\""), json)
+        assertTrue(json.contains("\"topBlockedThreads\""), json)
+    }
+
+    @Test
+    fun `layer-1 and digest json carry a compact lockContention with the top monitor`() {
+        val layer1 = Renderers.render(withLockContention(), OutputFormat.JSON)
+        assertTrue(layer1.contains("\"lockContention\""), layer1)
+        assertTrue(layer1.contains("\"topMonitor\""), layer1)
+        assertTrue(layer1.contains("\"class\": \"com.example.SharedLedger\""), layer1)
+        // Compact form: no per-monitor stack in Layer 1.
+        assertFalse(layer1.contains("lock.frame1"), layer1)
+
+        val digest = Renderers.render(withLockContention(), OutputFormat.JSON, options = RenderOptions(digest = true))
+        assertTrue(digest.contains("\"topMonitor\""), digest)
+        assertTrue(digest.contains("\"class\": \"com.example.SharedLedger\""), digest)
+    }
+
+    private fun withEstimatedLockContention() = withWaits().copy(
+        lockContention = LockContentionStats(
+            monitors = listOf(
+                ContendedMonitor(
+                    className = "com.example.SharedLedger", totalBlockedMs = 43_600.0, events = 28,
+                    topBlockedThreads = listOf("worker-6", "worker-7"), ownerThread = "worker-5",
+                    stack = listOf("com.example.SharedLedger.post"), estimated = true,
+                ),
+            ),
+            totalBlockedMs = 43_600.0,
+        ),
+    )
+
+    @Test
+    fun `estimated (sampled) contention is marked in the waits summary and json`() {
+        val summary = Renderers.render(
+            withEstimatedLockContention(), OutputFormat.SUMMARY, ReportView.FULL, RenderOptions(waits = true),
+        )
+        // Sampled figures get a `~` prefix and a "sampled" marker so they aren't read as exact.
+        assertTrue(summary.contains("total ~43.6s"), summary)
+        assertTrue(summary.contains(", sampled)"), summary)
+
+        val json = Renderers.render(
+            withEstimatedLockContention(), OutputFormat.JSON, options = RenderOptions(waits = true),
+        )
+        assertTrue(json.contains("\"estimated\": true"), json)
+
+        // The compact Layer-1 topMonitor also carries the estimated flag.
+        val layer1 = Renderers.render(withEstimatedLockContention(), OutputFormat.JSON)
+        assertTrue(layer1.contains("\"estimated\": true"), layer1)
+    }
+
+    // ---- off-CPU auto axis switch ------------------------------------------------------------
+
+    /** 100 samples over 30s (~3.3/s, idle) with one thread parked 20s: off-CPU-dominated. */
+    private fun offCpuResult() = result.copy(
+        durationMs = 30_000,
+        totalSamples = 100,
+        waits = WaitStats(
+            threads = listOf(
+                ThreadWait(
+                    "pool-1-thread-1", parkedMs = 20_000.0, monitorWaitMs = 0.0, sleepMs = 0.0,
+                    parkEvents = 50, monitorWaitEvents = 0, sleepEvents = 0,
+                    topBlockers = listOf("java.util.concurrent.SynchronousQueue"), stack = (1..10).map { "w.frame$it" },
+                ),
+            ),
+            totalWaitMs = 20_000.0,
+        ),
+    )
+
+    @Test
+    fun `off-CPU axis section leads the layer-1 summary when the target is off-CPU dominated`() {
+        val summary = Renderers.render(offCpuResult(), OutputFormat.SUMMARY, ReportView.FULL)
+        assertTrue(summary.contains("Off-CPU (dominant):"), summary)
+        assertTrue(summary.contains("pool-1-thread-1"), summary)
+        assertTrue(summary.contains("first blocker java.util.concurrent.SynchronousQueue"), summary)
+        assertTrue(summary.contains("Full breakdown: report --last --waits"), summary)
+        // No stacks in this lead-in section.
+        assertFalse(summary.contains("w.frame1"), summary)
+        // It comes before the hot-methods section.
+        assertTrue(summary.indexOf("Off-CPU (dominant):") < summary.indexOf("Top hot methods"), summary)
+    }
+
+    @Test
+    fun `off-CPU axis section appears even with zero CPU samples when waits dominate`() {
+        // 0 samples/sec is the strongest off-CPU case; it must not disable the axis switch.
+        val summary = Renderers.render(offCpuResult().copy(totalSamples = 0), OutputFormat.SUMMARY, ReportView.FULL)
+        assertTrue(summary.contains("Off-CPU (dominant):"), summary)
+    }
+
+    @Test
+    fun `off-CPU axis section is absent for a CPU-bound target`() {
+        // The default result is 200 samples over 5s (40/s) with no waits — not off-CPU dominated.
+        val summary = Renderers.render(result, OutputFormat.SUMMARY, ReportView.FULL)
+        assertFalse(summary.contains("Off-CPU (dominant):"), summary)
+    }
+
+    @Test
+    fun `off-CPU axis section names the top contended lock when contention is significant`() {
+        val summary = Renderers.render(offCpuResult().let(::withContendedLockOn), OutputFormat.SUMMARY, ReportView.FULL)
+        assertTrue(summary.contains("Off-CPU (dominant):"), summary)
+        assertTrue(summary.contains("contended lock 'com.example.SharedLedger'"), summary)
+    }
+
+    private fun withContendedLockOn(r: ProfileResult) = r.copy(
+        lockContention = LockContentionStats(
+            monitors = listOf(
+                ContendedMonitor(
+                    "com.example.SharedLedger", totalBlockedMs = 8_000.0, events = 120,
+                    topBlockedThreads = listOf("pool-1-thread-1"), ownerThread = "db-writer", stack = emptyList(),
+                ),
+            ),
+            totalBlockedMs = 8_000.0,
+        ),
+    )
+
+    // ---- view-switch redundancy trim ---------------------------------------------------------
+
+    @Test
+    fun `waits and drill views compress the hints block to a one-line pointer`() {
+        val waits = Renderers.render(withWaits(), OutputFormat.SUMMARY, ReportView.FULL, RenderOptions(waits = true))
+        assertTrue(waits.contains("Hints: 1 (shown in the main report)"), waits)
+        assertFalse(waits.contains("  * GC pauses account for"), waits)
+        // Warnings survive in secondary views for safety.
+        assertTrue(waits.contains("Warnings:"), waits)
+        assertTrue(waits.contains("Low sample count"), waits)
+
+        val drill = Renderers.render(deepResult(), OutputFormat.SUMMARY, ReportView.FULL, RenderOptions(methodIndex = 1))
+        assertTrue(drill.contains("Hints: 1 (shown in the main report)"), drill)
+
+        // Layer 1 keeps the full hints block.
+        val layer1 = Renderers.render(result, OutputFormat.SUMMARY, ReportView.FULL)
+        assertTrue(layer1.contains("  * GC pauses account for"), layer1)
+    }
+
+    @Test
+    fun `json keeps the full hints array in the waits view`() {
+        val json = Renderers.render(withWaits(), OutputFormat.JSON, options = RenderOptions(waits = true))
+        assertTrue(json.contains("\"hints\""), json)
+        assertTrue(json.contains("GC pauses account for"), json)
     }
 
     @Test

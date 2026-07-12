@@ -21,8 +21,8 @@ import java.time.Duration
  */
 class MemoryCommand : CliktCommand(
     name = "memory",
-    help = "Profile allocations of a running JVM. With a target, profiles synchronously; " +
-        "use start/stop/status for background recording.",
+    help = "Allocation-focused view of a full profile (same recording as 'profile'). With a target, " +
+        "profiles synchronously; use start/stop/status for background recording.",
     invokeWithoutSubcommand = true,
 ) {
     private val target by argument(

@@ -28,6 +28,12 @@ object InsightRules {
     /** GC pause share of wall-clock time considered worth flagging. */
     const val GC_PAUSE_SHARE = 0.10
 
+    /** Absolute blocked time (ms) on one monitor above which lock contention is worth flagging. */
+    const val LOCK_CONTENTION_MS = 1000.0
+
+    /** Blocked-time share of wall-clock time above which lock contention is worth flagging. */
+    const val LOCK_CONTENTION_DURATION_SHARE = 0.10
+
     /** Frame markers that indicate Robolectric sandbox class-loading work. */
     private val SANDBOX_FRAME_MARKERS = listOf("SandboxClassLoader", "org.robolectric")
 
@@ -176,7 +182,58 @@ object InsightRules {
             }
         }
 
+        // --- lock contention on a synchronized monitor ---
+        if (isLockContentionSignificant(result)) {
+            val top = result.lockContention!!.monitors.first()
+            val holder = top.ownerThread?.let { " (held mostly by '$it')" } ?: ""
+            // Estimated figures come from thread-state sampling (a monopolized lock emits no JFR
+            // enter events); flag them so the duration isn't read as exact.
+            val sampled = if (top.estimated) " (blocked time sampled from thread states)" else ""
+            hints += String.format(
+                Locale.US,
+                "Lock contention: threads blocked ~%.1fs total on the '%s' monitor%s; " +
+                    "see 'report --waits' for the blocked stacks.%s",
+                top.totalBlockedMs / 1000.0, top.className, holder, sampled,
+            )
+        }
+
+        // --- single-thread bottleneck ---
+        // Independent of the low-sample-rate warning path: this fires even at a healthy sample rate,
+        // where the process is clearly busy but the work is not parallelised.
+        val busiestThread = result.hotThreads.maxByOrNull { it.cpuPct }
+        if (result.totalSamples >= LOW_SAMPLE_COUNT &&
+            busiestThread != null && busiestThread.cpuPct >= BUSY_THREAD_SHARE_PCT
+        ) {
+            hints += String.format(
+                Locale.US,
+                "Execution is effectively single-threaded: '%s' holds %.0f%% of samples. If wall-clock " +
+                    "is the problem, look for serialization points (locks, unparallelized work).",
+                busiestThread.name, busiestThread.cpuPct,
+            )
+        }
+
         return Insights(warnings, hints)
+    }
+
+    /**
+     * True when the wall-clock is dominated by off-CPU time: the CPU sampler is nearly idle yet one
+     * thread spent at least half the recording parked/waiting. Used by the renderer to switch the
+     * default Layer-1 axis to off-CPU. Mirrors the wait/idle conditions used for the hints above.
+     */
+    fun isOffCpuDominant(result: ProfileResult): Boolean {
+        // Zero samples is the strongest off-CPU signal, so only a missing duration disqualifies.
+        if (result.durationMs <= 0) return false
+        val samplesPerSec = result.totalSamples / (result.durationMs / 1000.0)
+        val waits = result.waits ?: return false
+        val maxThreadWaitMs = waits.threads.maxOfOrNull { it.totalMs } ?: 0.0
+        return samplesPerSec < IDLE_SAMPLES_PER_SEC && maxThreadWaitMs >= 0.5 * result.durationMs
+    }
+
+    /** True when contention on the busiest monitor is large enough to surface as a hint/section. */
+    fun isLockContentionSignificant(result: ProfileResult): Boolean {
+        val top = result.lockContention?.monitors?.firstOrNull() ?: return false
+        return top.totalBlockedMs >= LOCK_CONTENTION_MS ||
+            (result.durationMs > 0 && top.totalBlockedMs >= LOCK_CONTENTION_DURATION_SHARE * result.durationMs)
     }
 
     /** Compact binary-scaled byte label (e.g. `120 MB`) for hint text; mirrors the renderer's format. */

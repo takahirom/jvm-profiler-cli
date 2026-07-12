@@ -57,6 +57,42 @@ data class WaitStats(
     val totalWaitMs: Double,
 )
 
+/**
+ * One contended synchronized monitor, aggregated from `jdk.JavaMonitorEnter` events (a thread
+ * blocked entering a monitor another thread already holds). Times are duration-weighted totals
+ * across all threads that blocked on this monitor.
+ */
+data class ContendedMonitor(
+    val className: String,
+    val totalBlockedMs: Double,
+    val events: Int,
+    /** Threads that blocked on this monitor, ranked by blocked time, most-blocked first. */
+    val topBlockedThreads: List<String>,
+    /** The thread most often seen holding the monitor (`previousOwner`), or null when unrecorded. */
+    val ownerThread: String?,
+    /** A representative stack from the single longest block, ordered leaf-first. */
+    val stack: List<String>,
+    /**
+     * True when [totalBlockedMs] is a sampled estimate from thread-state polling rather than an
+     * exact sum of `jdk.JavaMonitorEnter` durations. Estimated data is the only signal available
+     * when an unfair monitor is monopolized (losers stay BLOCKED and never commit an enter event),
+     * so renderers mark it (`~` / `sampled`) to keep the numbers from being over-trusted.
+     */
+    val estimated: Boolean = false,
+)
+
+/**
+ * Lock-contention analysis from `jdk.JavaMonitorEnter`. Surfaces synchronized monitors that
+ * threads spend real time blocked on — the classic serialization bottleneck. Rendered on demand
+ * (`report --waits`); null when the recording contained no monitor-enter events.
+ */
+data class LockContentionStats(
+    /** Contended monitors ranked by total blocked time, most-contended first. */
+    val monitors: List<ContendedMonitor>,
+    /** Sum of all monitors' blocked time (cumulative across threads). */
+    val totalBlockedMs: Double,
+)
+
 /** Garbage collection pause statistics over the recording. */
 data class GcStats(
     val count: Int,
@@ -136,6 +172,8 @@ data class ProfileResult(
     val classLoading: ClassLoadingStats?,
     /** Thread wait/park/sleep analysis for `report --waits`; null when no wait events were recorded. */
     val waits: WaitStats? = null,
+    /** Lock-contention analysis for `report --waits`; null when no monitor-enter events were recorded. */
+    val lockContention: LockContentionStats? = null,
     /** Post-GC heap trend (leak signal), or null when no `jdk.GCHeapSummary` events were recorded. */
     val heapTrend: HeapTrend? = null,
     val recordingPath: String?,
