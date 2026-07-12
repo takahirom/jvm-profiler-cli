@@ -152,8 +152,10 @@ Both the synchronous path and `profile start`/`cpu start` use JFR `dumponexit=tr
 dies before you `stop` still yields a salvageable `PARTIAL` recording.
 
 For JVMs that exit within seconds (attach loses the race entirely), have the JVM record itself:
-`JAVA_TOOL_OPTIONS='-XX:StartFlightRecording=filename=/tmp/rec.jfr,dumponexit=true' <command>`, then
-`clijvm report /tmp/rec.jfr`. See `clijvm guide short-lived`.
+`JAVA_TOOL_OPTIONS='-XX:StartFlightRecording=filename=/tmp/rec-%p.jfr,dumponexit=true' <command>`,
+then `clijvm report /tmp/rec-<pid>.jfr`. `JAVA_TOOL_OPTIONS` propagates to child JVMs, so use a
+unique filename per process (`%p` expands to the pid) or concurrent workers overwrite each other.
+See `clijvm guide short-lived`.
 
 ## Caveats
 
