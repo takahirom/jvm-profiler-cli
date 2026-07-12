@@ -29,13 +29,14 @@ build/install/clijvm/bin/clijvm list         # run the installed launcher
 ```
 clijvm --version                                  # print the build/release version
 clijvm list [--format table|json] [--test-workers] # attachable JVMs; Gradle test workers are marked
-clijvm cpu <target> [--duration 30s]              # synchronous CPU profile, then report
-clijvm cpu start|stop|status <target>             # background recording (see below)
-clijvm memory <target> [--duration 30s]           # synchronous allocation profile
-clijvm memory start|stop|status <target>          # background recording (shares cpu's recording)
+clijvm profile <target> [--duration 30s]          # full profile: CPU, allocation, GC, waits (start here)
+clijvm profile start|stop|status <target>         # background recording (see below)
+clijvm cpu <target> [--duration 30s]              # CPU-focused view of the same full recording
+clijvm memory <target> [--duration 30s]           # allocation-focused view of the same full recording
 clijvm heap <target> [--limit 20] [--format ...]  # class histogram (jcmd GC.class_histogram)
 clijvm report --list                              # inventory of saved recordings (pick one)
 clijvm report [--last | <file.jfr>] [--format ...] # re-analyse a saved recording (layered; see below)
+clijvm guide [jvm-test|server|build|short-lived|reading]  # diagnosis playbooks by situation
 ```
 
 - **`<target>`** is a pid, or a case-insensitive substring of a process display name. Ambiguous
@@ -46,14 +47,17 @@ clijvm report [--last | <file.jfr>] [--format ...] # re-analyse a saved recordin
   `…GradleWorkerMain 'Gradle Test Executor N'`; filter to just those with **`--test-workers`** and
   attach with `--wait GradleWorkerMain`.
 - **`--format`** is `summary` (default), `json`, or `collapsed`; **`--output <file>`** writes to a file.
-- Each recording gets a `<recording>.meta.json` sidecar (pid, mainClass, startedAt, partial) so a later
-  `report` shows the real main class and remembers a salvaged `PARTIAL` recording. A missing sidecar
-  falls back to the pid embedded in the filename.
+- Each recording gets a `<recording>.meta.json` sidecar (pid, mainClass, startedAt, partial, sampled
+  lock contention) so a later `report` shows the real main class, remembers a salvaged `PARTIAL`
+  recording, and keeps contention data the `.jfr` itself cannot carry. A missing sidecar falls back
+  to the pid embedded in the filename.
 - Every recording is saved to `~/.clijvm/recordings/<timestamp>-<pid>.jfr`, so you can re-view it in
   another format with `report` without paying to profile again.
-- **cpu and memory share one recording per process.** `settings=profile` captures both execution
-  samples and allocation events, so `cpu start` then `memory stop` on the same pid works and reports
-  allocations. Background session state lives in `~/.clijvm/sessions/<pid>.json`.
+- **profile, cpu, and memory share one full recording per process.** `settings=profile` captures
+  execution samples, allocation events, GC, and wait events in every run, so the commands differ only
+  in which view the report emphasises — picking the "wrong" one never requires re-recording, and
+  `cpu start` then `memory stop` on the same pid works. Background session state lives in
+  `~/.clijvm/sessions/<pid>.json`.
 
 ## Layered reports (progressive disclosure)
 
@@ -90,9 +94,18 @@ drill only into what matters. `report --help` teaches the whole workflow on its 
 
 Where does non-CPU time go? **`clijvm report --last --waits`** ranks threads by off-CPU time
 (park / monitor-wait / sleep), with per-type totals, event counts, top blocker classes, and a
-representative stack. Honors `--top` and `--max-stack-depth`; `--format json` supported. Reads the
-JFR `jdk.ThreadPark` / `jdk.JavaMonitorWait` / `jdk.ThreadSleep` events the recording already holds,
-so no re-profiling is needed.
+representative stack, plus a **Contended locks** section naming each contended monitor, its total
+blocked time, the blocked threads, and the holding thread. Honors `--top` and `--max-stack-depth`;
+`--format json` supported. Reads the JFR `jdk.ThreadPark` / `jdk.JavaMonitorWait` /
+`jdk.ThreadSleep` / `jdk.JavaMonitorEnter` events the recording already holds, so no re-profiling
+is needed.
+
+Lock contention has a JFR blind spot: `jdk.JavaMonitorEnter` only commits when a blocked thread
+finally *acquires* the monitor, so a monopolized lock can emit zero events despite severe blocking.
+During synchronous profiling clijvm therefore also samples thread states (`jcmd Thread.print`) and
+merges the result — sampled figures are marked `~`/`(sampled)` and persist to the recording's
+sidecar, so `report --last --waits` shows them too. When off-CPU time dominates, the default
+summary automatically leads with an **Off-CPU (dominant)** section instead of CPU hotspots.
 
 Pick the right recording first with **`clijvm report --list`** (file, timestamp, pid, mainClass, size;
 newest first; `--format json` for machines).
@@ -109,10 +122,14 @@ the drill-down `--method`/`--site` are `report`-only (you need Layer 1's indices
 
 ### Recommended AI workflow
 
-1. Profile: `clijvm cpu <target> --duration 20s` (or `memory`, or `heap`).
+1. Profile: `clijvm profile <target> --duration 20s` (full recording across all axes).
 2. Read the takeaways: `clijvm report --last --digest`.
 3. Skim the hotspots: `clijvm report --last --format json` (top 5, shallow stacks).
-4. Drill where it matters: `clijvm report --last --method <#N>` (or `--site <#N>`).
+4. Drill where it matters: `clijvm report --last --method <#N>` (or `--site <#N>`, `--waits`).
+
+Situational playbooks live in the CLI itself: `clijvm guide` lists them (`jvm-test`, `server`,
+`build`, `short-lived`, `reading`), and the root `--help` ends with the same 3-step workflow —
+a cold agent needs no external docs.
 
 ## Profiling Gradle test workers (Robolectric)
 
@@ -121,7 +138,7 @@ Gradle test workers are short-lived: they can die before you get to `stop`. Two 
 - **`--wait` (recommended)**: start clijvm *before* the worker exists and let it attach the moment
   it appears.
   ```bash
-  clijvm cpu --wait "Gradle Test Executor" --wait-timeout 120s --duration 20s --format json
+  clijvm profile --wait "Gradle Test Executor" --wait-timeout 120s --duration 20s --format json
   # then, in another shell: ./gradlew test
   ```
 - **Synchronous `--duration`** is the most dependable mode for short-lived processes, because the
@@ -131,8 +148,14 @@ Gradle test workers are short-lived: they can die before you get to `stop`. Two 
   stacktrace. If the target is `kill -9`'d it cannot dump on the way out; you then get a clean
   one-line error suggesting `--wait` with a shorter `--duration`.
 
-Both the synchronous path and `cpu start`/`memory start` use JFR `dumponexit=true`, so a worker that
+Both the synchronous path and `profile start`/`cpu start` use JFR `dumponexit=true`, so a worker that
 dies before you `stop` still yields a salvageable `PARTIAL` recording.
+
+For JVMs that exit within seconds (attach loses the race entirely), have the JVM record itself:
+`JAVA_TOOL_OPTIONS='-XX:StartFlightRecording=filename=/tmp/rec-%p.jfr,dumponexit=true' <command>`,
+then `clijvm report /tmp/rec-<pid>.jfr`. `JAVA_TOOL_OPTIONS` propagates to child JVMs, so use a
+unique filename per process (`%p` expands to the pid) or concurrent workers overwrite each other.
+See `clijvm guide short-lived`.
 
 ## Caveats
 

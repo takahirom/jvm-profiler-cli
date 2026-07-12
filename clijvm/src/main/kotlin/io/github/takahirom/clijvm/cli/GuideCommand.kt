@@ -35,8 +35,12 @@ class GuideCommand : CliktCommand(
     }
 }
 
-/** Trailer appended to the situational playbooks pointing at the report-reading discipline. */
-private const val READING_TRAILER = "\nFor reading the output: clijvm guide reading"
+/**
+ * Trailer appended to the situational playbooks pointing at the report-reading discipline.
+ * Worded as a trigger ("before concluding") so the reader fires it at the right moment,
+ * not as an optional footnote.
+ */
+private const val READING_TRAILER = "\nBefore concluding: clijvm guide reading — how to weigh warnings and hints."
 
 /** The one-line-per-topic index printed when `guide` is run without a topic. */
 private val GUIDE_INDEX = """
@@ -65,6 +69,8 @@ private val GUIDE_TOPICS: Map<String, String> = linkedMapOf(
                - a wide @Config sdk=[...] range multiplying the work.
           3. Drill into a hot method with:
                clijvm report --last --method N
+        Done when you can name what multiplies the test time (a hot method, sandbox
+        churn, or SDK spread) and the hint that shows it.
     """.trimIndent() + READING_TRAILER,
 
     "server" to """
@@ -81,6 +87,8 @@ private val GUIDE_TOPICS: Map<String, String> = linkedMapOf(
              look at waits and lock contention rather than hot methods:
                clijvm report --last --waits
           3. A thread blocked on a lock, socket, or sleep will not show as a CPU hotspot.
+        Done when the recording covers the slow window and you can name where its time
+        went: a CPU method, a contended lock, or a wait.
     """.trimIndent() + READING_TRAILER,
 
     "build" to """
@@ -96,6 +104,8 @@ private val GUIDE_TOPICS: Map<String, String> = linkedMapOf(
           3. Look for a single-thread bottleneck: one thread holding most of the samples
              means the work is not parallel. Also check GC pressure — frequent GCs or a
              rising post-GC heap point at allocation, not compute.
+        Done when you can say whether the build is single-thread-bound, GC-bound, or
+        CPU-bound, with the hint or thread share that shows it.
     """.trimIndent() + READING_TRAILER,
 
     "short-lived" to """
@@ -104,13 +114,15 @@ private val GUIDE_TOPICS: Map<String, String> = linkedMapOf(
 
         Recipe:
           Do not try to attach. Have the JVM record itself from the start:
-            JAVA_TOOL_OPTIONS='-XX:StartFlightRecording=filename=/tmp/rec.jfr,dumponexit=true' <command>
+            JAVA_TOOL_OPTIONS='-XX:StartFlightRecording=filename=/tmp/rec-%p.jfr,dumponexit=true' <command>
           then read the file it leaves behind:
-            clijvm report /tmp/rec.jfr
+            clijvm report /tmp/rec-<pid>.jfr
           Notes:
             - dumponexit=true guarantees a file even on a fast exit.
             - JAVA_TOOL_OPTIONS propagates to child JVMs, so forked workers record too;
-              give each a distinct filename if they overlap.
+              %p expands to each pid, keeping concurrent recordings from overwriting
+              each other.
+        Done when clijvm report prints a summary from the dumped file.
     """.trimIndent() + READING_TRAILER,
 
     "reading" to """
@@ -121,9 +133,8 @@ private val GUIDE_TOPICS: Map<String, String> = linkedMapOf(
         or a partial/salvaged recording all mean the data is noisy — do not conclude from
         it. Record longer or reproduce the load, then re-read.
 
-        Hints are ranked signals. When several hints appear, do not stop at the first
-        plausible cause: performance problems rarely have a single cause. Read them all
-        and weigh them before deciding.
+        Hints are suspects, not verdicts. Performance problems rarely have a single
+        culprit, so when several hints appear, weigh them all before delivering a verdict.
 
         Work the layers in order, going deeper only as needed:
           digest (--digest)  ->  summary (default)  ->  targeted drill-downs:
