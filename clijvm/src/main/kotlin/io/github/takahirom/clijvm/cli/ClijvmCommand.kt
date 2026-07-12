@@ -18,7 +18,7 @@ class ClijvmCommand : CliktCommand(
 
         3. follow the report's 'Drill in:' line to go deeper
 
-        Playbooks: clijvm guide jvm-test | server | build | short-lived | reading
+        Playbooks: clijvm guide slow-tests | slow-server | slow-build | short-lived | reading
     """.trimIndent(),
     printHelpOnEmptyArgs = true,
 ) {

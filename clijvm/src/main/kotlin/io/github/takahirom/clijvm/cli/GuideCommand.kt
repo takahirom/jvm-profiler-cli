@@ -45,17 +45,17 @@ private const val READING_TRAILER = "\nBefore concluding: clijvm guide reading â
 /** The one-line-per-topic index printed when `guide` is run without a topic. */
 private val GUIDE_INDEX = """
     clijvm guide <topic> â€” pick the playbook that matches your situation:
-      jvm-test     slow JVM/Robolectric/JUnit tests
-      server       slow long-lived service or daemon
-      build        slow Gradle/Maven build or batch job
+      slow-tests   slow JVM/Robolectric/JUnit tests
+      slow-server  slow long-lived service or daemon
+      slow-build   slow Gradle/Maven build or batch job
       short-lived  JVMs that exit within seconds (attach loses the race)
       reading      how to read a report without jumping to conclusions
 """.trimIndent()
 
 /** Topic name -> playbook text. Terse, imperative, plain text; keep each low-token. */
 private val GUIDE_TOPICS: Map<String, String> = linkedMapOf(
-    "jvm-test" to """
-        == guide: jvm-test ==
+    "slow-tests" to """
+        == guide: slow-tests ==
         Slow JVM tests (Robolectric, JUnit, Gradle Test Executor).
 
         Recipe:
@@ -73,8 +73,8 @@ private val GUIDE_TOPICS: Map<String, String> = linkedMapOf(
         churn, or SDK spread) and the hint that shows it.
     """.trimIndent() + READING_TRAILER,
 
-    "server" to """
-        == guide: server ==
+    "slow-server" to """
+        == guide: slow-server ==
         Slow long-lived service or daemon.
 
         Recipe:
@@ -91,8 +91,8 @@ private val GUIDE_TOPICS: Map<String, String> = linkedMapOf(
         went: a CPU method, a contended lock, or a wait.
     """.trimIndent() + READING_TRAILER,
 
-    "build" to """
-        == guide: build ==
+    "slow-build" to """
+        == guide: slow-build ==
         Slow Gradle/Maven build or batch job.
 
         Recipe:
