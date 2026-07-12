@@ -28,7 +28,7 @@ object Jcmd {
         val timedOut = AtomicBoolean(false)
         val watchdog = Thread {
             try {
-                if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS) && process.isAlive) {
                     timedOut.set(true)
                     process.destroyForcibly()
                 }
@@ -39,7 +39,8 @@ object Jcmd {
         val output = process.inputStream.bufferedReader().readText().trim()
         val exitCode = process.waitFor()
         watchdog.interrupt()
-        if (timedOut.get()) {
+        // exitCode 0 means the process actually completed at the timeout boundary — not a timeout.
+        if (timedOut.get() && exitCode != 0) {
             throw JcmdException("jcmd $pid ${args.joinToString(" ")} timed out after ${timeoutMs}ms and was killed")
         }
         if (exitCode != 0 || looksLikeFailure(output)) {
