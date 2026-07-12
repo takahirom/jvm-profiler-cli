@@ -107,12 +107,15 @@ class ReportCommand : CliktCommand(
         if (!Files.isReadable(file)) throw CliktError("Cannot read recording: $file")
 
         // Prefer the sidecar (main class, partial flag) when present; fall back to the filename pid.
+        // The sidecar also carries thread-state-sampled lock contention, merged in exactly as the
+        // live path does, so `report --waits` shows monopolized locks the .jfr cannot carry.
         val meta = readRecordingMeta(file)
         val result = JfrAnalyzer.analyze(
             file = file,
             pid = meta?.pid ?: pidFromFilename(file),
             mainClass = meta?.mainClass,
             partial = meta?.partial ?: false,
+            polledContention = meta?.sampledContention,
         )
         val options = buildRenderOptions(result)
         // A saved recording carries both CPU and allocation data, so report shows the full view.

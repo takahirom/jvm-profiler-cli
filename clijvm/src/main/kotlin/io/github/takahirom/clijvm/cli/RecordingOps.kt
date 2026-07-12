@@ -3,6 +3,7 @@ package io.github.takahirom.clijvm.cli
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.core.CliktError
 import io.github.takahirom.clijvm.analysis.JfrAnalyzer
+import io.github.takahirom.clijvm.analysis.ThreadStatePoller
 import io.github.takahirom.clijvm.attach.JvmProcess
 import io.github.takahirom.clijvm.attach.ProcessWaiter
 import io.github.takahirom.clijvm.jfr.JfrRecorder
@@ -82,6 +83,11 @@ fun CliktCommand.profileSynchronously(
         throw CliktError("Could not start recording on pid $pid (${process.displayName}): ${e.message}")
     }
 
+    // Sample thread states alongside the recording so monopolized (unfair) locks — which emit zero
+    // jdk.JavaMonitorEnter events — still surface as contention. Merged into the analysis below.
+    val poller = ThreadStatePoller.forDuration(pid, duration.toMillis())
+    poller.start()
+
     val finished = AtomicBoolean(false)
     val startedAt = System.currentTimeMillis()
 
@@ -95,12 +101,20 @@ fun CliktCommand.profileSynchronously(
         recorder.stop()
         Files.deleteIfExists(salvageFile)
         val durationMs = System.currentTimeMillis() - startedAt
-        writeRecordingMeta(recordingFile, RecordingMeta(pid, process.displayName, startedAt, partial = false))
+        val polled = runCatching { poller.stop(durationMs) }.getOrNull()
+        // Persist the sampled contention so `report --waits` on this recording can show it too —
+        // it lives nowhere in the .jfr (a monopolized monitor emits no JavaMonitorEnter events).
+        writeRecordingMeta(
+            recordingFile,
+            RecordingMeta(pid, process.displayName, startedAt, partial = false, sampledContention = polled),
+        )
         echo("Recording saved to $recordingFile")
-        report(JfrAnalyzer.analyze(recordingFile, pid, process.displayName, durationMs))
+        report(JfrAnalyzer.analyze(recordingFile, pid, process.displayName, durationMs, polledContention = polled))
     }
 
     fun reportSalvaged(diedAfterMs: Long) {
+        // The target is dead, so thread-state polling can no longer reach it; drop any partial data.
+        runCatching { poller.stop(diedAfterMs) }
         val salvaged = awaitSalvage(salvageFile)
             ?: throw CliktError(
                 "Target JVM (pid $pid) exited before any data could be dumped. " +

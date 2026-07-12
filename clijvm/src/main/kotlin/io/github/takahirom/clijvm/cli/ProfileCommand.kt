@@ -10,19 +10,22 @@ import com.github.ajalt.clikt.parameters.options.option
 import com.github.ajalt.clikt.parameters.types.int
 import io.github.takahirom.clijvm.render.RenderOptions
 import io.github.takahirom.clijvm.render.ReportView
+import io.github.takahirom.clijvm.session.SessionStore
 import io.github.takahirom.clijvm.util.parseDuration
 import java.time.Duration
 
 /**
- * `clijvm cpu <target> [--duration 30s]` — synchronous CPU profiling via JFR.
+ * `clijvm profile <target> [--duration 30s]` — the canonical entry point.
  *
- * Also the parent of the background verbs `start`, `stop`, and `status`. When one of those
- * subcommands is invoked, this command does nothing; otherwise it profiles [target] synchronously.
+ * Records the same JFR profile as `cpu`/`memory` but renders the FULL report (CPU + allocation +
+ * GC + class loading + heap trend), so every axis is visible from one command. `cpu` and `memory`
+ * are focused views of this same recording. Also the parent of the background verbs
+ * `start`, `stop`, and `status`; when one of those is invoked, this command does nothing.
  */
-class CpuCommand : CliktCommand(
-    name = "cpu",
-    help = "CPU-focused view of a full profile (same recording as 'profile'). With a target, " +
-        "profiles synchronously; use start/stop/status for background recording.",
+class ProfileCommand : CliktCommand(
+    name = "profile",
+    help = "Profile a running JVM across all axes (CPU, allocation, GC, waits) and print a summary. " +
+        "The recommended first command; cpu/memory are focused views of the same full recording.",
     invokeWithoutSubcommand = true,
 ) {
     private val target by argument(
@@ -48,7 +51,7 @@ class CpuCommand : CliktCommand(
     ).flag()
     private val top by option(
         "--top",
-        help = "Layer 1 — how many hot methods/threads to show (default 5; 0 = no limit).",
+        help = "Layer 1 — how many hot methods/threads/sites to show (default 5; 0 = no limit).",
     ).int().default(RenderOptions.DEFAULT_TOP)
     private val maxStackDepth by option(
         "--max-stack-depth",
@@ -61,6 +64,23 @@ class CpuCommand : CliktCommand(
 
         val process = resolveOrWait(target, wait, waitTimeout)
         val options = RenderOptions(top = top, maxStackDepth = maxStackDepth, digest = digest)
-        profileSynchronously(process, duration, ReportView.CPU, format, output, options)
+        profileSynchronously(process, duration, ReportView.FULL, format, output, options)
     }
+}
+
+/** `clijvm profile stop <target>` — dump and stop a background recording, then print the FULL report. */
+class ProfileStopCommand(
+    private val sessions: SessionStore = SessionStore(),
+) : CliktCommand(
+    name = "stop",
+    help = "Stop a background recording, save it, and print the full profile report.",
+) {
+    private val target by argument(
+        name = "target",
+        help = "A pid, or a case-insensitive substring of a process display name.",
+    )
+    private val format by option("--format", help = "Output format for the report.").outputFormat()
+    private val output by option("--output", help = "Write the report to a file instead of stdout.")
+
+    override fun run() = doStop(target, sessions, ReportView.FULL, format, output)
 }

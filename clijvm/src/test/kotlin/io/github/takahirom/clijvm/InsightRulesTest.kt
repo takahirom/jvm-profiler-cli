@@ -3,12 +3,14 @@ package io.github.takahirom.clijvm
 import io.github.takahirom.clijvm.analysis.AllocationSite
 import io.github.takahirom.clijvm.analysis.AllocationStats
 import io.github.takahirom.clijvm.analysis.ClassLoadingStats
+import io.github.takahirom.clijvm.analysis.ContendedMonitor
 import io.github.takahirom.clijvm.analysis.GcStats
 import io.github.takahirom.clijvm.analysis.HotMethod
 import io.github.takahirom.clijvm.analysis.HotThread
 import io.github.takahirom.clijvm.analysis.HeapTrend
 import io.github.takahirom.clijvm.analysis.HeapTrendDirection
 import io.github.takahirom.clijvm.analysis.InsightRules
+import io.github.takahirom.clijvm.analysis.LockContentionStats
 import io.github.takahirom.clijvm.analysis.ProfileResult
 import io.github.takahirom.clijvm.analysis.ThreadWait
 import io.github.takahirom.clijvm.analysis.WaitStats
@@ -227,5 +229,115 @@ class InsightRulesTest {
     fun `partial recordings are warned about`() {
         val insights = InsightRules.derive(baseline(partial = true))
         assertTrue(insights.warnings.any { it.contains("salvaged") }, "${insights.warnings}")
+    }
+
+    // ---- lock contention ---------------------------------------------------------------------
+
+    private fun contention(
+        className: String = "com.example.SharedLedger",
+        totalBlockedMs: Double = 12_400.0,
+        ownerThread: String? = "db-writer",
+    ) = LockContentionStats(
+        monitors = listOf(
+            ContendedMonitor(
+                className = className,
+                totalBlockedMs = totalBlockedMs,
+                events = 200,
+                topBlockedThreads = listOf("worker-1", "worker-2"),
+                ownerThread = ownerThread,
+                stack = listOf("com.example.SharedLedger.post"),
+            ),
+        ),
+        totalBlockedMs = totalBlockedMs,
+    )
+
+    @Test
+    fun `hints on lock contention naming the monitor and the holding thread`() {
+        val insights = InsightRules.derive(baseline(durationMs = 30_000).copy(lockContention = contention()))
+        assertTrue(
+            insights.hints.any {
+                it.contains("Lock contention") && it.contains("com.example.SharedLedger") &&
+                    it.contains("held mostly by 'db-writer'") && it.contains("report --waits")
+            },
+            "${insights.hints}",
+        )
+    }
+
+    @Test
+    fun `lock contention hint omits the holder clause when the owner is unknown`() {
+        val insights = InsightRules.derive(baseline().copy(lockContention = contention(ownerThread = null)))
+        val hint = insights.hints.first { it.contains("Lock contention") }
+        assertTrue(hint.contains("com.example.SharedLedger"), hint)
+        assertFalse(hint.contains("held mostly by"), hint)
+    }
+
+    @Test
+    fun `lock contention hint fires at the absolute threshold but not just below it`() {
+        // 30s recording: 10% share is 3000 ms, so only the 1000 ms absolute floor is in play here.
+        val below = InsightRules.derive(
+            baseline(durationMs = 30_000).copy(lockContention = contention(totalBlockedMs = 999.0)),
+        )
+        assertFalse(below.hints.any { it.contains("Lock contention") }, "${below.hints}")
+        val at = InsightRules.derive(
+            baseline(durationMs = 30_000).copy(lockContention = contention(totalBlockedMs = 1000.0)),
+        )
+        assertTrue(at.hints.any { it.contains("Lock contention") }, "${at.hints}")
+    }
+
+    @Test
+    fun `lock contention hint fires on the duration-share threshold below the absolute floor`() {
+        // 500 ms blocked is under the 1000 ms floor but is 10% of a 5s recording.
+        val insights = InsightRules.derive(
+            baseline(durationMs = 5_000).copy(lockContention = contention(totalBlockedMs = 500.0)),
+        )
+        assertTrue(insights.hints.any { it.contains("Lock contention") }, "${insights.hints}")
+    }
+
+    // ---- single-thread bottleneck ------------------------------------------------------------
+
+    @Test
+    fun `hints when execution is effectively single-threaded`() {
+        val insights = InsightRules.derive(
+            baseline(
+                totalSamples = 1000,
+                hotThreads = listOf(HotThread("worker", 95.0, 950), HotThread("other", 5.0, 50)),
+            ),
+        )
+        assertTrue(
+            insights.hints.any {
+                it.contains("effectively single-threaded") && it.contains("worker") && it.contains("95%")
+            },
+            "${insights.hints}",
+        )
+    }
+
+    @Test
+    fun `no single-thread hint when work is spread across threads`() {
+        val insights = InsightRules.derive(
+            baseline(hotThreads = listOf(HotThread("a", 40.0, 400), HotThread("b", 35.0, 350), HotThread("c", 25.0, 250))),
+        )
+        assertFalse(insights.hints.any { it.contains("effectively single-threaded") }, "${insights.hints}")
+    }
+
+    @Test
+    fun `no single-thread hint below the low sample count`() {
+        val insights = InsightRules.derive(
+            baseline(totalSamples = 100, hotThreads = listOf(HotThread("worker", 99.0, 99))),
+        )
+        assertFalse(insights.hints.any { it.contains("effectively single-threaded") }, "${insights.hints}")
+    }
+
+    @Test
+    fun `single-thread hint coexists with the idle helper-threads warning`() {
+        // 250 samples over 30s = ~8/s (idle rate) with one thread at 98%: both signals apply and
+        // agree (busy single thread, idle process), so they must not contradict each other.
+        val insights = InsightRules.derive(
+            baseline(
+                totalSamples = 250, durationMs = 30_000,
+                hotThreads = listOf(HotThread("worker", 98.0, 245), HotThread("other", 2.0, 5)),
+            ),
+        )
+        assertTrue(insights.warnings.any { it.contains("helper threads") }, "${insights.warnings}")
+        assertTrue(insights.hints.any { it.contains("effectively single-threaded") }, "${insights.hints}")
     }
 }
