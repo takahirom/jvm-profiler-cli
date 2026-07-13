@@ -6,6 +6,7 @@ import java.time.Duration
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class ProcessWaiterTest {
     private fun proc(pid: Long, name: String) = JvmProcess(pid, name, isGradleWorker = false)
@@ -60,6 +61,14 @@ class ProcessWaiterTest {
             selfPid = 7,
         )
         assertEquals(99L, result?.pid)
+    }
+
+    @Test
+    fun `timeout message names the target and gives the wait-timeout retry hint`() {
+        val message = ProcessWaiter.timeoutMessage("Gradle Test Executor", Duration.ofSeconds(120))
+        assertTrue(message.contains("No JVM matching \"Gradle Test Executor\" appeared within 120s"), message)
+        assertTrue(message.contains("Gradle compiles before test workers spawn"), message)
+        assertTrue(message.contains("--wait-timeout 600s"), message)
     }
 
     @Test

@@ -41,7 +41,7 @@ fun CliktCommand.resolveOrWait(target: String?, wait: String?, waitTimeout: Dura
     if (wait != null) {
         echo("Waiting up to ${waitTimeout.toSeconds()}s for a JVM whose name contains \"$wait\" ...")
         val process = ProcessWaiter.awaitProcess(wait, waitTimeout)
-            ?: throw CliktError("No JVM matching \"$wait\" appeared within ${waitTimeout.toSeconds()}s.")
+            ?: throw CliktError(ProcessWaiter.timeoutMessage(wait, waitTimeout))
         echo("Matched pid ${process.pid} (${process.displayName}).")
         return process
     }

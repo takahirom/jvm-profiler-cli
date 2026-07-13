@@ -95,7 +95,9 @@ drill only into what matters. `report --help` teaches the whole workflow on its 
 Where does non-CPU time go? **`clijvm report --last --waits`** ranks threads by off-CPU time
 (park / monitor-wait / sleep), with per-type totals, event counts, top blocker classes, and a
 representative stack, plus a **Contended locks** section naming each contended monitor, its total
-blocked time, the blocked threads, and the holding thread. Honors `--top` and `--max-stack-depth`;
+blocked time, the blocked threads, and the holding thread. JVM housekeeping threads (Cleaner,
+Finalizer, …) and idle worker-pool parks are hidden by default with a hidden-count line —
+`--full` shows them, and JSON always carries every thread. Honors `--top` and `--max-stack-depth`;
 `--format json` supported. Reads the JFR `jdk.ThreadPark` / `jdk.JavaMonitorWait` /
 `jdk.ThreadSleep` / `jdk.JavaMonitorEnter` events the recording already holds, so no re-profiling
 is needed.
@@ -160,7 +162,8 @@ See `clijvm guide short-lived`.
 ## Caveats
 
 - **Allocation bytes are estimates.** They are extrapolated from sampled allocation events; treat
-  them as relative magnitudes, not exact totals.
+  them as relative magnitudes, not exact totals. Each site shows its sampled event count, and a
+  site resting on very few events is marked `low confidence` (`"lowConfidence": true` in JSON).
 - **Sampling granularity.** Short or mostly-idle recordings yield few CPU samples, making self%
   noisy. clijvm emits a `warnings` entry when the sample count is low or the target looks idle;
   prefer a longer `--duration` for stable hotspots.

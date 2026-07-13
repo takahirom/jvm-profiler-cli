@@ -8,6 +8,7 @@ import io.github.takahirom.clijvm.analysis.HeapTrendDirection
 import io.github.takahirom.clijvm.analysis.HotMethod
 import io.github.takahirom.clijvm.analysis.InsightRules
 import io.github.takahirom.clijvm.analysis.LockContentionStats
+import io.github.takahirom.clijvm.analysis.OffCpuNoise
 import io.github.takahirom.clijvm.analysis.ProfileResult
 import io.github.takahirom.clijvm.analysis.ThreadWait
 import io.github.takahirom.clijvm.analysis.WaitStats
@@ -148,12 +149,17 @@ object Renderers {
             appendLine("  (no wait events captured)")
             return
         }
+        // Header figures stay over ALL threads so the totals remain truthful; only the ranked list
+        // hides housekeeping/idle threads. `--full` (top = 0) shows everything unfiltered.
         val n = waits.threads.size
         appendLine(
             "Thread waits by total off-CPU time (${formatMillis(waits.totalWaitMs)} across " +
                 "$n ${if (n == 1) "thread" else "threads"}):"
         )
-        limit(waits.threads, options.top).forEachIndexed { i, t ->
+        val filtered = options.top > 0
+        val ranked = if (filtered) waits.threads.filterNot { OffCpuNoise.isSuppressed(it) } else waits.threads
+        val hidden = waits.threads.size - ranked.size
+        limit(ranked, options.top).forEachIndexed { i, t ->
             appendLine(
                 String.format(
                     Locale.US,
@@ -168,6 +174,9 @@ object Renderers {
                 appendLine("        blockers: ${t.topBlockers.take(3).joinToString(", ")}")
             }
             appendStack(t.stack, options.maxStackDepth)
+        }
+        if (hidden > 0) {
+            appendLine("  ($hidden housekeeping/idle threads hidden; --full shows them)")
         }
     }
 
@@ -268,11 +277,12 @@ object Renderers {
                     appendLine(
                         String.format(
                             Locale.US,
-                            "  #%-2d %5.1f%%  %10s  %s",
+                            "  #%-2d %5.1f%%  %10s  %s  %s",
                             i + 1,
                             site.sharePct,
                             formatBytes(site.bytes),
                             site.className,
+                            allocationConfidenceNote(site),
                         )
                     )
                     appendStack(site.stack, options.maxStackDepth)
@@ -294,7 +304,8 @@ object Renderers {
         if (!InsightRules.isOffCpuDominant(result)) return
         val waits = result.waits ?: return
         appendLine("Off-CPU (dominant):")
-        limit(waits.threads, 3).forEach { t ->
+        // Skip housekeeping/idle threads so the lead-in surfaces the real blocker, not a parked Cleaner.
+        limit(waits.threads.filterNot { OffCpuNoise.isSuppressed(it) }, 3).forEach { t ->
             val blocker = t.topBlockers.firstOrNull()?.let { "; first blocker $it" } ?: ""
             appendLine(
                 String.format(
@@ -647,6 +658,9 @@ object Renderers {
                 add("bytes" to jsonInt(site.bytes))
                 add("sharePct" to jsonNumber(site.sharePct))
                 add("events" to jsonInt(site.events))
+                if (site.events < InsightRules.LOW_ALLOCATION_CONFIDENCE_EVENTS) {
+                    add("lowConfidence" to jsonBool(true))
+                }
                 addAll(stackEntries(site.stack, maxDepth))
             }
         )
@@ -670,6 +684,17 @@ object Renderers {
             // Collapsed frames are root-first; trimming keeps the root-most [maxStackDepth] frames.
             "${limitStack(stack.frames, options.maxStackDepth).joinToString(";")} ${stack.samples}"
         }
+
+    /**
+     * Event-count annotation for a Layer-1 allocation line, e.g. `(25 events)` or, when the sample
+     * base is too small to trust the extrapolated bytes, `(1 event — low confidence)`.
+     */
+    private fun allocationConfidenceNote(site: AllocationSite): String {
+        val unit = if (site.events == 1) "event" else "events"
+        val lowConfidence =
+            if (site.events < InsightRules.LOW_ALLOCATION_CONFIDENCE_EVENTS) " — low confidence" else ""
+        return "(${site.events} $unit$lowConfidence)"
+    }
 
     /** Formats a byte count with a binary-scaled unit, e.g. `1.9 MB`. */
     fun formatBytes(bytes: Long): String {

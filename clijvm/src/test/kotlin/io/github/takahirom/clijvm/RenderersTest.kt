@@ -543,4 +543,107 @@ class RenderersTest {
         val stableSummary = Renderers.render(stable, OutputFormat.SUMMARY, ReportView.FULL, RenderOptions(digest = true))
         assertTrue(stableSummary.contains("Post-GC heap: stable"), stableSummary)
     }
+
+    // ---- allocation-site confidence -----------------------------------------------------------
+
+    @Test
+    fun `layer-1 allocation lines carry the event count and a low-confidence suffix below the threshold`() {
+        val lowConfidence = result.copy(
+            allocation = allocation.copy(
+                topSites = listOf(
+                    AllocationSite("byte[]", 150_000_000_000L, 66.6, 1, listOf("io.example.A.alloc")),
+                    AllocationSite("java.lang.String", 1_000_000, 33.3, 25, listOf("io.example.B.alloc")),
+                ),
+            ),
+        )
+        val summary = Renderers.render(lowConfidence, OutputFormat.SUMMARY, ReportView.MEMORY)
+        // The single-event top site is flagged; the well-sampled one just shows its count.
+        assertTrue(summary.contains("(1 event — low confidence)"), summary)
+        assertTrue(summary.contains("(25 events)"), summary)
+        assertFalse(summary.contains("(25 events — low confidence)"), summary)
+    }
+
+    @Test
+    fun `allocation json flags low-confidence sites only below the threshold`() {
+        val lowConfidence = result.copy(
+            allocation = allocation.copy(
+                topSites = listOf(
+                    AllocationSite("byte[]", 150_000_000_000L, 66.6, 1, listOf("io.example.A.alloc")),
+                    AllocationSite("java.lang.String", 1_000_000, 33.3, 25, listOf("io.example.B.alloc")),
+                ),
+            ),
+        )
+        val json = Renderers.render(lowConfidence, OutputFormat.JSON)
+        assertEquals(1, Regex("\"lowConfidence\": true").findAll(json).count(), json)
+    }
+
+    // ---- off-CPU noise suppression in the waits view ------------------------------------------
+
+    /** A cleaner thread (housekeeping), an idle pool worker, and one genuinely blocked thread. */
+    private fun withNoisyWaits() = result.copy(
+        durationMs = 60_000,
+        totalSamples = 60,
+        waits = WaitStats(
+            threads = listOf(
+                ThreadWait("Cleaner-1", parkedMs = 58_000.0, monitorWaitMs = 0.0, sleepMs = 0.0, parkEvents = 1, monitorWaitEvents = 0, sleepEvents = 0, topBlockers = emptyList(), stack = listOf("jdk.internal.ref.CleanerImpl.run")),
+                ThreadWait("pool-1-thread-1", parkedMs = 58_000.0, monitorWaitMs = 0.0, sleepMs = 0.0, parkEvents = 1, monitorWaitEvents = 0, sleepEvents = 0, topBlockers = emptyList(), stack = listOf("java.util.concurrent.ThreadPoolExecutor.getTask")),
+                ThreadWait("app-worker", parkedMs = 40_000.0, monitorWaitMs = 0.0, sleepMs = 0.0, parkEvents = 5, monitorWaitEvents = 0, sleepEvents = 0, topBlockers = listOf("com.example.Latch"), stack = listOf("com.example.Service.awaitResult")),
+            ),
+            totalWaitMs = 156_000.0,
+        ),
+    )
+
+    @Test
+    fun `waits view hides housekeeping and idle threads and reports the hidden count`() {
+        val summary = Renderers.render(withNoisyWaits(), OutputFormat.SUMMARY, ReportView.FULL, RenderOptions(waits = true))
+        assertTrue(summary.contains("app-worker"), summary)
+        assertFalse(summary.contains("Cleaner-1"), summary)
+        assertFalse(summary.contains("pool-1-thread-1"), summary)
+        assertTrue(summary.contains("(2 housekeeping/idle threads hidden; --full shows them)"), summary)
+        // The header total stays computed over all three threads (truthful figures).
+        assertTrue(summary.contains("across 3 threads"), summary)
+    }
+
+    @Test
+    fun `full waits view shows every thread unfiltered with no hidden-count line`() {
+        val summary = Renderers.render(withNoisyWaits(), OutputFormat.SUMMARY, ReportView.FULL, RenderOptions.FULL.copy(waits = true))
+        assertTrue(summary.contains("Cleaner-1"), summary)
+        assertTrue(summary.contains("pool-1-thread-1"), summary)
+        assertTrue(summary.contains("app-worker"), summary)
+        assertFalse(summary.contains("housekeeping/idle threads hidden"), summary)
+    }
+
+    @Test
+    fun `waits json stays unfiltered so structured consumers see every thread`() {
+        val json = Renderers.render(withNoisyWaits(), OutputFormat.JSON, options = RenderOptions(waits = true))
+        assertTrue(json.contains("\"thread\": \"Cleaner-1\""), json)
+        assertTrue(json.contains("\"thread\": \"pool-1-thread-1\""), json)
+        assertTrue(json.contains("\"thread\": \"app-worker\""), json)
+        assertFalse(json.contains("housekeeping/idle threads hidden"), json)
+    }
+
+    @Test
+    fun `off-CPU lead-in is not triggered by housekeeping or idle threads alone`() {
+        val housekeepingOnly = result.copy(
+            durationMs = 60_000,
+            totalSamples = 60,
+            waits = WaitStats(
+                threads = listOf(
+                    ThreadWait("Cleaner-1", parkedMs = 58_000.0, monitorWaitMs = 0.0, sleepMs = 0.0, parkEvents = 1, monitorWaitEvents = 0, sleepEvents = 0, topBlockers = emptyList(), stack = listOf("jdk.internal.ref.CleanerImpl.run")),
+                    ThreadWait("pool-1-thread-1", parkedMs = 58_000.0, monitorWaitMs = 0.0, sleepMs = 0.0, parkEvents = 1, monitorWaitEvents = 0, sleepEvents = 0, topBlockers = emptyList(), stack = listOf("java.util.concurrent.ThreadPoolExecutor.getTask")),
+                ),
+                totalWaitMs = 116_000.0,
+            ),
+        )
+        val summary = Renderers.render(housekeepingOnly, OutputFormat.SUMMARY, ReportView.FULL)
+        assertFalse(summary.contains("Off-CPU (dominant):"), summary)
+    }
+
+    @Test
+    fun `off-CPU lead-in fires for a genuinely blocked thread and skips the parked cleaner`() {
+        val summary = Renderers.render(withNoisyWaits(), OutputFormat.SUMMARY, ReportView.FULL)
+        assertTrue(summary.contains("Off-CPU (dominant):"), summary)
+        assertTrue(summary.contains("app-worker"), summary)
+        assertFalse(summary.substringBefore("Top hot methods").contains("Cleaner-1"), summary)
+    }
 }

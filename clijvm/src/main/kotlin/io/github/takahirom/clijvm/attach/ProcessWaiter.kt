@@ -10,6 +10,16 @@ import java.time.Duration
  */
 object ProcessWaiter {
 
+    /**
+     * Error text for a `--wait` timeout. Carries the actionable hint that a too-short default is
+     * the usual cause under Gradle: compilation runs before test workers spawn, so 120s often
+     * elapses before the target process even exists.
+     */
+    fun timeoutMessage(substring: String, timeout: Duration): String =
+        "No JVM matching \"$substring\" appeared within ${timeout.toSeconds()}s. " +
+            "Gradle compiles before test workers spawn, so the default 120s is often too short — " +
+            "retry with --wait-timeout 600s."
+
     /** Processes whose display name contains [substring] (case-insensitive). */
     fun match(substring: String, processes: List<JvmProcess>): List<JvmProcess> =
         processes.filter { it.displayName.contains(substring, ignoreCase = true) }

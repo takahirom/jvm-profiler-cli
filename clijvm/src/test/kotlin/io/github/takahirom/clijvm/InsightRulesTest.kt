@@ -15,6 +15,7 @@ import io.github.takahirom.clijvm.analysis.ProfileResult
 import io.github.takahirom.clijvm.analysis.ThreadWait
 import io.github.takahirom.clijvm.analysis.WaitStats
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -409,4 +410,102 @@ class InsightRulesTest {
         assertTrue(insights.hints.any { it.contains("possible leak") }, "${insights.hints}")
         assertFalse(insights.hints.any { it.contains("state leaks between tests") }, "${insights.hints}")
     }
+
+    // ---- kotlinx.coroutines debug-mode hint ---------------------------------------------------
+
+    private fun allocationOf(className: String, events: Int, stack: List<String>) = AllocationStats(
+        source = "jdk.ObjectAllocationSample",
+        totalBytes = 1000,
+        totalEvents = events,
+        topSites = listOf(AllocationSite(className, 1000, 100.0, events, stack)),
+    )
+
+    @Test
+    fun `hints on coroutine debug cost in allocation hot paths, with the trade-off stated`() {
+        val insights = InsightRules.derive(
+            baseline(allocation = allocationOf("kotlinx.coroutines.CoroutineId", events = 20, stack = listOf("kotlinx.coroutines.CoroutineId.updateThreadContext"))),
+        )
+        val hint = insights.hints.find { it.contains("kotlinx.coroutines debug mode") }
+        assertTrue(hint != null, "${insights.hints}")
+        assertTrue(hint.contains("trade-off"), hint)
+        assertTrue(hint.contains("only if allocation/GC is your bottleneck"), hint)
+    }
+
+    @Test
+    fun `debug mode being merely on does not fire the coroutine hint`() {
+        // @coroutine#N thread names prove debug mode is enabled, not that it costs anything —
+        // and in tests its diagnosability is usually worth keeping.
+        val insights = InsightRules.derive(
+            baseline(hotThreads = listOf(HotThread("DefaultDispatcher-worker-1 @coroutine#7", 80.0, 800))),
+        )
+        assertFalse(insights.hints.any { it.contains("kotlinx.coroutines debug mode") }, "${insights.hints}")
+    }
+
+    @Test
+    fun `no coroutine debug hint without any signal`() {
+        val insights = InsightRules.derive(baseline(hotThreads = listOf(HotThread("DefaultDispatcher-worker-1", 80.0, 800))))
+        assertFalse(insights.hints.any { it.contains("kotlinx.coroutines debug mode") }, "${insights.hints}")
+    }
+
+    // ---- Robolectric font-copy hint -----------------------------------------------------------
+
+    @Test
+    fun `hints on Robolectric font copying in allocation hot paths`() {
+        val insights = InsightRules.derive(
+            baseline(allocation = allocationOf("byte[]", events = 30, stack = listOf("org.robolectric.nativeruntime.DefaultNativeRuntimeLoader.maybeCopyFonts"))),
+        )
+        assertTrue(
+            insights.hints.any { it.contains("font copying") && it.contains("maybeCopyFonts") },
+            "${insights.hints}",
+        )
+    }
+
+    // ---- low-confidence top allocation site ---------------------------------------------------
+
+    @Test
+    fun `warns when the top allocation site rests on too few sampled events`() {
+        val insights = InsightRules.derive(baseline(allocation = allocationOf("byte[]", events = 1, stack = emptyList())))
+        assertTrue(
+            insights.warnings.any { it.contains("extrapolated from only 1 sampled event") && it.contains("rough") },
+            "${insights.warnings}",
+        )
+    }
+
+    @Test
+    fun `no low-confidence warning when the top site has enough events`() {
+        val insights = InsightRules.derive(baseline(allocation = allocationOf("byte[]", events = 25, stack = emptyList())))
+        assertFalse(insights.warnings.any { it.contains("extrapolated from only") }, "${insights.warnings}")
+    }
+
+    // ---- off-CPU trigger ignores housekeeping/idle threads ------------------------------------
+
+    @Test
+    fun `off-CPU dominant is not triggered by housekeeping or idle threads alone`() {
+        val waits = WaitStats(
+            threads = listOf(
+                ThreadWait("Cleaner-1", parkedMs = 58_000.0, monitorWaitMs = 0.0, sleepMs = 0.0, parkEvents = 1, monitorWaitEvents = 0, sleepEvents = 0, topBlockers = emptyList(), stack = listOf("jdk.internal.ref.CleanerImpl.run")),
+                ThreadWait("pool-1-thread-1", parkedMs = 58_000.0, monitorWaitMs = 0.0, sleepMs = 0.0, parkEvents = 1, monitorWaitEvents = 0, sleepEvents = 0, topBlockers = emptyList(), stack = listOf("java.util.concurrent.ThreadPoolExecutor.getTask")),
+            ),
+            totalWaitMs = 116_000.0,
+        )
+        val result = baseline(totalSamples = 60, durationMs = 60_000).copy(waits = waits)
+        assertFalse(InsightRules.isOffCpuDominant(result))
+        assertFalse(insightsOffCpuHint(result), "off-CPU hint should not fire for housekeeping/idle only")
+    }
+
+    @Test
+    fun `off-CPU dominant is triggered by a genuinely blocked thread`() {
+        val waits = WaitStats(
+            threads = listOf(
+                ThreadWait("Cleaner-1", parkedMs = 58_000.0, monitorWaitMs = 0.0, sleepMs = 0.0, parkEvents = 1, monitorWaitEvents = 0, sleepEvents = 0, topBlockers = emptyList(), stack = listOf("jdk.internal.ref.CleanerImpl.run")),
+                ThreadWait("main", parkedMs = 40_000.0, monitorWaitMs = 0.0, sleepMs = 0.0, parkEvents = 1, monitorWaitEvents = 0, sleepEvents = 0, topBlockers = emptyList(), stack = listOf("com.example.Service.awaitResult")),
+            ),
+            totalWaitMs = 98_000.0,
+        )
+        val result = baseline(totalSamples = 60, durationMs = 60_000).copy(waits = waits)
+        assertTrue(InsightRules.isOffCpuDominant(result))
+    }
+
+    private fun insightsOffCpuHint(result: ProfileResult): Boolean =
+        InsightRules.derive(result).hints.any { it.contains("off-CPU") && it.contains("report --waits") }
 }
