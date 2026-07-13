@@ -421,37 +421,28 @@ class InsightRulesTest {
     )
 
     @Test
-    fun `hints on coroutine debug mode from thread names`() {
-        val insights = InsightRules.derive(
-            baseline(hotThreads = listOf(HotThread("DefaultDispatcher-worker-1 @coroutine#7", 80.0, 800))),
-        )
-        assertTrue(
-            insights.hints.any { it.contains("kotlinx.coroutines debug mode") && it.contains("debug=off") },
-            "${insights.hints}",
-        )
-    }
-
-    @Test
-    fun `hints on coroutine debug mode from allocation class names`() {
+    fun `hints on coroutine debug cost in allocation hot paths, with the trade-off stated`() {
         val insights = InsightRules.derive(
             baseline(allocation = allocationOf("kotlinx.coroutines.CoroutineId", events = 20, stack = listOf("kotlinx.coroutines.CoroutineId.updateThreadContext"))),
         )
-        assertTrue(insights.hints.any { it.contains("kotlinx.coroutines debug mode") }, "${insights.hints}")
+        val hint = insights.hints.find { it.contains("kotlinx.coroutines debug mode") }
+        assertTrue(hint != null, "${insights.hints}")
+        assertTrue(hint.contains("trade-off"), hint)
+        assertTrue(hint.contains("only if allocation/GC is your bottleneck"), hint)
     }
 
     @Test
-    fun `coroutine debug hint fires once even when both signals match`() {
+    fun `debug mode being merely on does not fire the coroutine hint`() {
+        // @coroutine#N thread names prove debug mode is enabled, not that it costs anything —
+        // and in tests its diagnosability is usually worth keeping.
         val insights = InsightRules.derive(
-            baseline(
-                hotThreads = listOf(HotThread("worker @coroutine#3", 80.0, 800)),
-                allocation = allocationOf("kotlinx.coroutines.CoroutineId", events = 20, stack = emptyList()),
-            ),
+            baseline(hotThreads = listOf(HotThread("DefaultDispatcher-worker-1 @coroutine#7", 80.0, 800))),
         )
-        assertEquals(1, insights.hints.count { it.contains("kotlinx.coroutines debug mode") }, "${insights.hints}")
+        assertFalse(insights.hints.any { it.contains("kotlinx.coroutines debug mode") }, "${insights.hints}")
     }
 
     @Test
-    fun `no coroutine debug hint without the signals`() {
+    fun `no coroutine debug hint without any signal`() {
         val insights = InsightRules.derive(baseline(hotThreads = listOf(HotThread("DefaultDispatcher-worker-1", 80.0, 800))))
         assertFalse(insights.hints.any { it.contains("kotlinx.coroutines debug mode") }, "${insights.hints}")
     }

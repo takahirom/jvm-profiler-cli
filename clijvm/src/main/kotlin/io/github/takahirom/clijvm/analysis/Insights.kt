@@ -68,9 +68,6 @@ object InsightRules {
      */
     const val LOW_ALLOCATION_CONFIDENCE_EVENTS = 5
 
-    /** Matches kotlinx.coroutines debug-mode thread names such as "DefaultDispatcher-worker-1 @coroutine#7". */
-    private val COROUTINE_DEBUG_THREAD_REGEX = Regex("""@coroutine#\d+""")
-
     /** Class/frame markers of the CoroutineId that debug mode threads through allocations. */
     private val COROUTINE_ID_MARKERS = listOf("kotlinx.coroutines.CoroutineId", "CoroutineId")
 
@@ -172,15 +169,19 @@ object InsightRules {
                 "(@Config spread) avoids it."
         }
 
-        // --- kotlinx.coroutines debug mode (thread names carry @coroutine#N, or CoroutineId allocs) ---
-        val coroutineDebugByThread = result.hotThreads.any { COROUTINE_DEBUG_THREAD_REGEX.containsMatchIn(it.name) }
-        val coroutineDebugByAllocation = result.allocation?.topSites.orEmpty().any { site ->
+        // --- kotlinx.coroutines debug-mode cost showing up in allocation hot paths ---
+        // Debug mode being merely ON (thread names carry @coroutine#N) is not worth a hint: it
+        // exists to make coroutine failures diagnosable, which is exactly what tests want. Only
+        // flag it when its CoroutineId bookkeeping actually surfaces in the measured hot paths,
+        // and present the trade-off rather than a one-sided "turn it off".
+        val coroutineDebugCost = result.allocation?.topSites.orEmpty().any { site ->
             COROUTINE_ID_MARKERS.any { m -> site.className.contains(m) || site.stack.any { it.contains(m) } }
         }
-        if (coroutineDebugByThread || coroutineDebugByAllocation) {
-            hints += "kotlinx.coroutines debug mode appears to be on (thread names carry @coroutine#N; " +
-                "auto-enabled by -ea in test workers). It adds allocation and thread-name overhead; " +
-                "consider -Dkotlinx.coroutines.debug=off."
+        if (coroutineDebugCost) {
+            hints += "kotlinx.coroutines debug mode's CoroutineId bookkeeping appears in allocation hot " +
+                "paths (debug mode is auto-enabled by -ea in test workers). It buys better coroutine " +
+                "stack traces on failure, so this is a trade-off: only if allocation/GC is your " +
+                "bottleneck, try -Dkotlinx.coroutines.debug=off."
         }
 
         // --- multiple Android SDK worker threads ---
