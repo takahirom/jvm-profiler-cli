@@ -340,4 +340,73 @@ class InsightRulesTest {
         assertTrue(insights.warnings.any { it.contains("helper threads") }, "${insights.warnings}")
         assertTrue(insights.hints.any { it.contains("effectively single-threaded") }, "${insights.hints}")
     }
+
+    // ---- UI idle-wait hint --------------------------------------------------------------------
+
+    private fun idleWait(thread: String, totalMs: Double, frame: String) = ThreadWait(
+        thread = thread, parkedMs = totalMs, monitorWaitMs = 0.0, sleepMs = 0.0,
+        parkEvents = 10, monitorWaitEvents = 0, sleepEvents = 0,
+        topBlockers = emptyList(),
+        stack = listOf("jdk.internal.misc.Unsafe.park", frame, "org.junit.runners.ParentRunner.run"),
+    )
+
+    @Test
+    fun `idle-wait hint fires when waitForIdle waits dominate`() {
+        // 12s of a 30s recording (40%) parked inside Compose's waitForIdle loop.
+        val waits = WaitStats(
+            threads = listOf(idleWait("Test worker", 12_000.0, "androidx.compose.ui.test.ComposeUiTest.waitForIdle")),
+            totalWaitMs = 12_000.0,
+        )
+        val insights = InsightRules.derive(baseline().copy(waits = waits))
+        assertTrue(insights.hints.any { it.contains("waiting for the UI to become idle") }, "${insights.hints}")
+    }
+
+    @Test
+    fun `no idle-wait hint below the share threshold or for non-idle stacks`() {
+        // 3s of 30s (10%) is below IDLE_WAIT_SHARE.
+        val small = WaitStats(
+            threads = listOf(idleWait("Test worker", 3_000.0, "ComposeIdlingResource.isIdleNow")),
+            totalWaitMs = 3_000.0,
+        )
+        assertFalse(
+            InsightRules.derive(baseline().copy(waits = small))
+                .hints.any { it.contains("waiting for the UI to become idle") },
+        )
+        // Long waits without idle-synchronization frames must not fire it either.
+        val unrelated = WaitStats(
+            threads = listOf(idleWait("db-writer", 20_000.0, "java.util.concurrent.LinkedBlockingQueue.take")),
+            totalWaitMs = 20_000.0,
+        )
+        assertFalse(
+            InsightRules.derive(baseline().copy(waits = unrelated))
+                .hints.any { it.contains("waiting for the UI to become idle") },
+        )
+    }
+
+    // ---- test-context leak hint ---------------------------------------------------------------
+
+    private val growingHeap = HeapTrend(
+        direction = HeapTrendDirection.GROWING,
+        gcCount = 40,
+        firstThirdAvgBytes = 100L shl 20,
+        lastThirdAvgBytes = 400L shl 20,
+        minBytes = 90L shl 20,
+        maxBytes = 420L shl 20,
+    )
+
+    @Test
+    fun `growing heap in a test worker names leaks between tests`() {
+        val insights = InsightRules.derive(
+            baseline(hotThreads = listOf(HotThread("SDK 33 Main Thread", 90.0, 900)))
+                .copy(waits = null, heapTrend = growingHeap),
+        )
+        assertTrue(insights.hints.any { it.contains("state leaks between tests") }, "${insights.hints}")
+    }
+
+    @Test
+    fun `growing heap outside a test context stays generic`() {
+        val insights = InsightRules.derive(baseline().copy(heapTrend = growingHeap))
+        assertTrue(insights.hints.any { it.contains("possible leak") }, "${insights.hints}")
+        assertFalse(insights.hints.any { it.contains("state leaks between tests") }, "${insights.hints}")
+    }
 }

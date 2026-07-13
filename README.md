@@ -21,7 +21,7 @@ clijvm list                                                  # attachable JVMs (
 clijvm profile <pid> --duration 30s                          # profile every axis (CPU, allocation, GC, waits)
 clijvm profile --wait "Gradle Test Executor" --duration 20s  # wait for a test worker to appear, then attach
 clijvm report --last --format json                           # re-render the last recording for an AI to read
-clijvm guide                                                 # playbooks: slow-tests / slow-server / slow-build / short-lived / reading
+clijvm guide                                                 # playbooks: slow-tests / slow-robolectric-tests / slow-server / slow-build / short-lived / reading
 ```
 
 Example: pointing it at a Robolectric test run surfaces the diagnosis directly in `hints`:

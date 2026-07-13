@@ -8,7 +8,8 @@ import kotlin.test.assertTrue
 
 class GuideCommandTest {
 
-    private val topics = listOf("slow-tests", "slow-server", "slow-build", "short-lived", "reading")
+    private val topics =
+        listOf("slow-tests", "slow-robolectric-tests", "slow-server", "slow-build", "short-lived", "reading")
 
     @Test
     fun `no topic prints an index listing every topic`() {
@@ -30,7 +31,7 @@ class GuideCommandTest {
 
     @Test
     fun `situational topics point back at the reading guide`() {
-        for (topic in listOf("slow-tests", "slow-server", "slow-build", "short-lived")) {
+        for (topic in listOf("slow-tests", "slow-robolectric-tests", "slow-server", "slow-build", "short-lived")) {
             val result = GuideCommand().test(topic)
             assertTrue(
                 result.output.contains("clijvm guide reading"),

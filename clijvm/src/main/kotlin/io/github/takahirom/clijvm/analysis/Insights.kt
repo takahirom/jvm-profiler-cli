@@ -40,6 +40,16 @@ object InsightRules {
     /** Matches Robolectric per-SDK worker threads such as "SDK 33 Main Thread". */
     private val SDK_THREAD_REGEX = Regex("""SDK\s*\d+""")
 
+    /** Wait-stack frames of UI idle-synchronization loops (Compose/Espresso/Robolectric loopers). */
+    private val IDLE_WAIT_FRAME_MARKERS = listOf(
+        "waitForIdle", "ComposeIdlingResource", "IdlingResourceRegistry", "IdlingRegistry",
+        "ComposeUiTest", "androidx.test.espresso.base.UiControllerImpl", "ShadowLooper.idle",
+        "ShadowPausedLooper",
+    )
+
+    /** Idle-wait share of wall-clock time above which the idle-wait hint fires. */
+    const val IDLE_WAIT_SHARE = 0.25
+
     /** Frame markers of coverage-agent instrumentation (JaCoCo). */
     private val COVERAGE_FRAME_MARKERS = listOf("org.jacoco", "CRC64", "Instrumenter")
 
@@ -161,11 +171,32 @@ object InsightRules {
         // --- post-GC heap growth (possible leak) ---
         result.heapTrend?.let { trend ->
             if (trend.direction == HeapTrendDirection.GROWING) {
+                // In a test worker the classic cause is state leaking between tests, so name it.
+                val testContext = if (looksLikeTestWorker(result)) {
+                    " In a test run this usually means state leaks between tests " +
+                        "(unclosed ActivityScenario, static references)."
+                } else {
+                    ""
+                }
                 hints += "Post-GC heap grew from ~${formatBytes(trend.firstThirdAvgBytes)} to " +
                     "~${formatBytes(trend.lastThirdAvgBytes)} over the recording (${trend.gcCount} GCs); " +
-                    "possible leak or growing retained set."
+                    "possible leak or growing retained set.$testContext"
             }
             // Flat/shrinking heap is surfaced as a positive digest signal by the renderer, not a hint.
+        }
+
+        // --- UI idle-waiting in tests (Compose/Espresso waitForIdle, ShadowLooper idling) ---
+        // The most common user-fixable cause of slow UI tests: an animation (often infinite)
+        // keeps the UI non-idle, so every waitForIdle burns its full timeout.
+        val idleWaitMs = idleWaitMillis(result)
+        if (result.durationMs > 0 && idleWaitMs >= IDLE_WAIT_SHARE * result.durationMs) {
+            hints += String.format(
+                Locale.US,
+                "Tests spent ~%.1fs waiting for the UI to become idle (waitForIdle/Espresso idling). " +
+                    "Long or infinite animations are the usual cause — disable animations in tests or " +
+                    "check rememberInfiniteTransition/repeating animators.",
+                idleWaitMs / 1000.0,
+            )
         }
 
         // --- significant non-CPU (wait/park/sleep) time ---
@@ -228,6 +259,20 @@ object InsightRules {
         val maxThreadWaitMs = waits.threads.maxOfOrNull { it.totalMs } ?: 0.0
         return samplesPerSec < IDLE_SAMPLES_PER_SEC && maxThreadWaitMs >= 0.5 * result.durationMs
     }
+
+    /** True when the profile looks like a test worker (Robolectric SDK threads or a Gradle test worker). */
+    private fun looksLikeTestWorker(result: ProfileResult): Boolean =
+        result.hotThreads.any { SDK_THREAD_REGEX.containsMatchIn(it.name) } ||
+            result.mainClass?.contains("GradleWorkerMain") == true
+
+    /**
+     * Total off-CPU time of threads whose wait stack sits in a UI idle-synchronization loop.
+     * Zero when no wait data was recorded.
+     */
+    private fun idleWaitMillis(result: ProfileResult): Double =
+        result.waits?.threads.orEmpty()
+            .filter { t -> t.stack.any { frame -> IDLE_WAIT_FRAME_MARKERS.any { frame.contains(it) } } }
+            .sumOf { it.totalMs }
 
     /** True when contention on the busiest monitor is large enough to surface as a hint/section. */
     fun isLockContentionSignificant(result: ProfileResult): Boolean {
