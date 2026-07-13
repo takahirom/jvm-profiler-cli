@@ -45,32 +45,51 @@ private const val READING_TRAILER = "\nBefore concluding: clijvm guide reading �
 /** The one-line-per-topic index printed when `guide` is run without a topic. */
 private val GUIDE_INDEX = """
     clijvm guide <topic> — pick the playbook that matches your situation:
-      slow-tests   slow JVM/Robolectric/JUnit tests
-      slow-server  slow long-lived service or daemon
-      slow-build   slow Gradle/Maven build or batch job
-      short-lived  JVMs that exit within seconds (attach loses the race)
-      reading      how to read a report without jumping to conclusions
+      slow-tests              slow JVM/JUnit tests
+      slow-robolectric-tests  slow Robolectric/Compose tests (idle waits, leaks, sandbox)
+      slow-server             slow long-lived service or daemon
+      slow-build              slow Gradle/Maven build or batch job
+      short-lived             JVMs that exit within seconds (attach loses the race)
+      reading                 how to read a report without jumping to conclusions
 """.trimIndent()
 
 /** Topic name -> playbook text. Terse, imperative, plain text; keep each low-token. */
 private val GUIDE_TOPICS: Map<String, String> = linkedMapOf(
     "slow-tests" to """
         == guide: slow-tests ==
-        Slow JVM tests (Robolectric, JUnit, Gradle Test Executor).
+        Slow JVM tests (JUnit, Gradle Test Executor).
 
         Recipe:
           1. Start the tests, then immediately in another shell:
                clijvm profile --wait "Gradle Test Executor" --duration 30s
              --wait matches the worker as it spawns; the recording salvages on exit if
              the worker dies mid-run, so you still get a report.
-          2. Read the hints. For Robolectric, watch for:
-               - heavy sandbox class loading (many classes loaded per test = per-test
-                 sandbox churn; share @Config or reduce SDK spread).
-               - a wide @Config sdk=[...] range multiplying the work.
-          3. Drill into a hot method with:
+          2. Read the hints, then drill into a hot method with:
                clijvm report --last --method N
-        Done when you can name what multiplies the test time (a hot method, sandbox
-        churn, or SDK spread) and the hint that shows it.
+             If CPU looks idle, the time is off-CPU: clijvm report --last --waits
+        Done when you can name what multiplies the test time and the hint that shows it.
+        Robolectric/Compose/Android tests: clijvm guide slow-robolectric-tests
+    """.trimIndent() + READING_TRAILER,
+
+    "slow-robolectric-tests" to """
+        == guide: slow-robolectric-tests ==
+        Slow Robolectric/Compose tests — the common causes, most user-fixable first.
+
+        Capture as in 'guide slow-tests':
+          clijvm profile --wait "Gradle Test Executor" --duration 30s
+
+        Check in this order:
+          1. UI idle-waiting: an idle-wait hint, or wait stacks in waitForIdle /
+             Espresso idling. A long or infinite animation keeps the UI non-idle, so
+             every waitForIdle burns its full timeout. Disable animations in tests;
+             check rememberInfiniteTransition and repeating animators.
+          2. Leaks between tests: a rising post-GC heap across the run points at
+             unclosed ActivityScenario or static references keeping Activities alive.
+          3. Sandbox churn: thousands of classes loaded during the recording means
+             per-test sandbox rebuilds; share @Config across tests.
+          4. SDK spread: several "SDK NN Main Thread" threads means @Config sdk=[...]
+             multiplies every cost above; narrow the SDK list.
+        Done when you can name which of the four dominates and the hint that shows it.
     """.trimIndent() + READING_TRAILER,
 
     "slow-server" to """

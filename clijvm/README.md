@@ -36,7 +36,7 @@ clijvm memory <target> [--duration 30s]           # allocation-focused view of t
 clijvm heap <target> [--limit 20] [--format ...]  # class histogram (jcmd GC.class_histogram)
 clijvm report --list                              # inventory of saved recordings (pick one)
 clijvm report [--last | <file.jfr>] [--format ...] # re-analyse a saved recording (layered; see below)
-clijvm guide [slow-tests|slow-server|slow-build|short-lived|reading]  # diagnosis playbooks by symptom
+clijvm guide [slow-tests|slow-robolectric-tests|slow-server|slow-build|short-lived|reading]  # diagnosis playbooks by symptom
 ```
 
 - **`<target>`** is a pid, or a case-insensitive substring of a process display name. Ambiguous
@@ -128,8 +128,8 @@ the drill-down `--method`/`--site` are `report`-only (you need Layer 1's indices
 4. Drill where it matters: `clijvm report --last --method <#N>` (or `--site <#N>`, `--waits`).
 
 Situational playbooks live in the CLI itself: `clijvm guide` lists them (`slow-tests`,
-`slow-server`, `slow-build`, `short-lived`, `reading`), and the root `--help` ends with the same
-3-step workflow — a cold agent needs no external docs.
+`slow-robolectric-tests`, `slow-server`, `slow-build`, `short-lived`, `reading`), and the root
+`--help` ends with the same 3-step workflow — a cold agent needs no external docs.
 
 ## Profiling Gradle test workers (Robolectric)
 
